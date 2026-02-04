@@ -1,0 +1,7 @@
+ragas
+pandas
+datasets
+openpyxl
+matplotlib
+seaborn
+numpy
