@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.dist/
+.build/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Project outputs
+outputs/
+
+# Data (keep sample excel tracked)
+*.xlsx
+!data/gold_questions.xlsx
+
+# Logs
+*.log
+
+src/rag_eval/__init__.py
