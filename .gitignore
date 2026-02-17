@@ -31,5 +31,3 @@ outputs/
 
 # Logs
 *.log
-
-src/rag_eval/__init__.py

@@ -19,7 +19,7 @@ def run_eval_notebook(
         from rag_eval.notebook import run_eval_notebook
         run_eval_notebook(
             "data/gold_questions.xlsx",
-            ["examples.rag_systems"],
+            ["rag_systems"],
             ["e5-large", "bge-3", "langchain"],
         )
     """

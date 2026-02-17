@@ -5,3 +5,8 @@ openpyxl
 matplotlib
 seaborn
 numpy
+tqdm
+jinja2
+langchain-gigachat
+sentence-transformers
+faiss-cpu

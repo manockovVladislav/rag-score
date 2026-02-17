@@ -1,107 +1,106 @@
-# RAGAS тестовая система для RAG
+# RAGAS оценка для RAG
 
-Этот репозиторий — отдельная система оценки качества RAG на базе **ragas**.
-Золотые вопросы хранятся в Excel и могут пополняться аналитиком.
-Подключение разных RAG-систем делается через декоратор `@rag_system(...)`.
+Проект для оценки RAG-систем через ragas. Запуск только из Jupyter.
 
-## Быстрый старт через Jupyter Notebook
+## Что делаем
 
-Основной рекомендуемый запуск — из ноутбука. Готовый пример: `examples/run_eval.ipynb`.
+1. Кладём векторную базу в `vector_db/`.
+2. Выбираем модель ретривера (`e5-large` или `bge-3`).
+3. Запускаем `eval_rag.ipynb`.
+4. Получаем отчёт по золотым вопросам.
 
-Минимальный код:
+## Структура
 
-```python
-import sys, os
-root = os.path.abspath('..')  # если ноутбук лежит в examples/
-src = os.path.join(root, 'src')
-if src not in sys.path:
-    sys.path.insert(0, src)
+- `data/` — Excel с вопросами
+- `rag_eval/` — код оценки и отчёта
+- `rag_systems.py` — реестр RAG и FAISS‑ретривер
+- `eval_rag.ipynb` — запуск
+- `vector_db/` — FAISS индекс и документы
+- `reports/` — отчёты (создаётся автоматически)
 
-from rag_eval import run_eval_notebook
+## Запуск
 
-run_eval_notebook(
-    gold_path=os.path.join(root, 'data', 'gold_questions.xlsx'),
-    registry_modules=['examples.rag_systems'],
-    system_names=['e5-large', 'bge-3', 'langchain'],
-)
+Откройте `eval_rag.ipynb` и выполните ячейки сверху вниз.
+
+## Форматы и типы данных
+
+### 1) Золотые вопросы (Excel)
+
+Файл в `data/` (например, `gold_questions.xlsx`).
+Колонки:
+- `question` (str, обяз.) — текст вопроса
+- `ground_truth` (str, опц.) — эталонный ответ
+
+Допускаются синонимы колонок, они будут нормализованы:
+- `question`: `query`, `q`, `вопрос`, `вопрос_пользователя`
+- `ground_truth`: `reference`, `answer_gt`, `эталон`, `эталонный_ответ`, `правильный_ответ`
+
+### 2) Векторная база (FAISS)
+
+Папка `vector_db/` рядом с проектом.
+Должны быть:
+- `index.faiss` — FAISS индекс
+- `docs.json` **или** `docs.jsonl` — тексты документов
+
+Структура папки:
+```
+vector_db/
+  index.faiss
+  docs.json            # или docs.jsonl
 ```
 
-Результаты будут сохранены в `outputs/<timestamp>/<system_name>/`.
-
-## Формат Excel с золотыми вопросами
-
-Ожидаются колонки:
-- `question` — текст вопроса
-- `ground_truth` — эталонный ответ
-
-Пример находится в `data/gold_questions.xlsx`.
-
-## Подключение своих RAG-систем
-
-1) Создайте модуль, например `examples/rag_systems.py`.
-2) Зарегистрируйте системы через декоратор.
-3) В `answer(question)` верните `RagResponse`.
-
-Минимальный шаблон:
-
-```python
-from rag_eval import rag_system
-from rag_eval.registry import RagResponse
-
-class MyRag:
-    def answer(self, question: str) -> RagResponse:
-        # 1) собрать контексты
-        # 2) сгенерировать ответ
-        return RagResponse(answer="...", contexts=["..."])
-
-@rag_system("my-rag")
-def build_my_rag():
-    return MyRag()
+Формат `docs.json`:
+```json
+[
+  {
+    "id": "doc-001",
+    "text": "Полный текст документа или чанка",
+    "metadata": {
+      "source": "file.pdf",
+      "page": 12,
+      "title": "Документ"
+    }
+  }
+]
 ```
 
-Запуск:
-
-```bash
-python -m rag_eval.run_eval \
-  --gold data/gold_questions.xlsx \
-  --registries examples.rag_systems,my_custom_module \
-  --systems my-rag
+Формат `docs.jsonl`:
+```jsonl
+{"id": "doc-001", "text": "Полный текст документа или чанка", "metadata": {"source": "file.pdf", "page": 12}}
+{"id": "doc-002", "text": "Ещё один чанк", "metadata": {"source": "site", "url": "https://..."}}
 ```
 
-## Что сохраняется
+Важно: порядок текстов в `docs.*` должен совпадать с порядком вектора в `index.faiss`.
 
-Для каждой системы создается папка с результатами:
-- `raw_answers.csv` — сырые ответы + контексты
-- `per_question_metrics.csv` — метрики по каждому вопросу
-- `overall_metrics.json` — агрегированные метрики
-- `overall_metrics.png` — график агрегированных метрик
-- `per_question_metrics.png` — график метрик по вопросам (если есть)
-- `report.md` — короткий markdown отчет
+### 3) Ретривер и модели
 
-## Где менять параметры
+В `eval_rag.ipynb` задаются пути к локальным моделям:
+- `E5_MODEL_PATH`
+- `BGE3_MODEL_PATH`
 
-- Список метрик ragas: `src/rag_eval/run_eval.py`
-- Формат данных: `src/rag_eval/run_eval.py`
-- Реестр и адаптер: `src/rag_eval/registry.py`
+В `rag_systems.py` ретривер использует:
+- `VECTOR_DB_DIR` (по умолчанию `vector_db/`)
+- `RETRIEVER_TOP_K`
 
-## Запуск через Jupyter Notebook
+Формат данных для ретривера:
+- вход: `query: str` (текст вопроса)
+- выход: `list[str]` (список текстов/чанков, которые пойдут в `contexts`)
 
-Готовый пример ноутбука: `examples/run_eval.ipynb`.
+Как формировать индекс:
+- каждый элемент в `docs.*` соответствует одному вектору в `index.faiss`
+- обязательное поле: `text`
+- опциональные поля: `id`, `metadata` (любые ключи)
 
-Минимальный код внутри ноутбука:
-
-```python
-import sys, os
-root = os.path.abspath('..')  # если ноутбук лежит в examples/
-src = os.path.join(root, 'src')
-if src not in sys.path:
-    sys.path.insert(0, src)
-
-from rag_eval.notebook import run_eval_notebook
-
-run_eval_notebook(
-    gold_path=os.path.join(root, 'data', 'gold_questions.xlsx'),
-    registry_modules=['examples.rag_systems'],
-    system_names=['e5-large', 'bge-3', 'langchain'],
-)
+Структура кода ретривера:
 ```
+build_retriever(model_name, db_path)
+  -> faiss.read_index(...)
+  -> load docs.json / docs.jsonl
+  -> SentenceTransformer(model_path)
+  -> retrieve(query) -> list[str]
+```
+
+## Отчёт
+
+HTML‑отчёт лежит в `reports/<run_id>/`.
+Секция **Config** показывает параметры ретривера из ноутбука.
