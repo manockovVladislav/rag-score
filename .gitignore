@@ -31,3 +31,7 @@ outputs/
 
 # Logs
 *.log
+
+/reports
+/vector_db
+data/test_10_pages.md

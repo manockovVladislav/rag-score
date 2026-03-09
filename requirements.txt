@@ -2,11 +2,7 @@ ragas
 pandas
 datasets
 openpyxl
-matplotlib
-seaborn
-numpy
-tqdm
-jinja2
 langchain-gigachat
+langchain-openai
 sentence-transformers
 faiss-cpu

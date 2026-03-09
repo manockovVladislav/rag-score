@@ -1,6 +1,6 @@
 """RAG evaluation toolkit based on ragas."""
 
-from .registry import rag_system, get_rag_system, load_registries
 from .notebook import run_eval_notebook
+from .run_eval import latest_xlsx, run_single_rag_eval
 
-__all__ = ["rag_system", "get_rag_system", "load_registries", "run_eval_notebook"]
+__all__ = ["latest_xlsx", "run_eval_notebook", "run_single_rag_eval"]

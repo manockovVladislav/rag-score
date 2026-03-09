@@ -1,27 +1,28 @@
-"""Утилиты для запуска оценки из Jupyter."""
+"""Notebook helper for running a single RAG system evaluation."""
 
 from __future__ import annotations
 
-from typing import List
-
-from .run_eval import run_eval
+from .run_eval import run_single_rag_eval
 
 
 def run_eval_notebook(
     gold_path: str,
-    registry_modules: List[str],
-    system_names: List[str],
-    output_root: str = "outputs",
-) -> None:
-    """Запуск ragas-оценки из ноутбука.
+    rag_system,
+    judge_llm,
+    judge_embeddings=None,
+    ragas_run_config=None,
+    reports_dir: str = "reports",
+    run_name: str = "rag",
+):
+    return run_single_rag_eval(
+        gold_path=gold_path,
+        rag_system=rag_system,
+        judge_llm=judge_llm,
+        judge_embeddings=judge_embeddings,
+        ragas_run_config=ragas_run_config,
+        reports_dir=reports_dir,
+        run_name=run_name,
+    )
 
-    Пример:
-        from rag_eval.notebook import run_eval_notebook
-        run_eval_notebook(
-            "data/gold_questions.xlsx",
-            ["rag_systems"],
-            ["e5-large", "bge-3", "langchain"],
-        )
-    """
 
-    run_eval(gold_path, registry_modules, system_names, output_root)
+__all__ = ["run_eval_notebook"]

@@ -1,106 +1,90 @@
-# RAGAS оценка для RAG
+# RAGAS оценка одной RAG-системы
 
-Проект для оценки RAG-систем через ragas. Запуск только из Jupyter.
+Минимальный проект для оценки одной проверяемой RAG-системы через `ragas` в Jupyter.
 
-## Что делаем
+## Быстрый старт
 
-1. Кладём векторную базу в `vector_db/`.
-2. Выбираем модель ретривера (`e5-large` или `bge-3`).
-3. Запускаем `eval_rag.ipynb`.
-4. Получаем отчёт по золотым вопросам.
+1. Установите зависимости:
+   - `pip install -r requirements.txt`
+2. Запустите KoboldCpp (если используете локальный backend):
+   - `./koboldcpp --model ~/models/gguf/Phi-3.5-mini-instruct-IQ4_XS.gguf --port 5001`
+3. Выберите backend в окружении:
+   - `export LLM_BACKEND=koboldcpp` или `export LLM_BACKEND=gigachat`
+4. Откройте `eval_rag.ipynb` и выполните ячейки сверху вниз.
+
+## Архитектура
+
+- `rag_systems/gigachat_bge_m3.py` — проверяемая система:
+  - генерация через переключаемый backend (`gigachat` или `koboldcpp`);
+  - ретривер на локальной `bge-m3` (`/home/vladislav/models/bge-m3`);
+  - чтение FAISS базы из `vector_db/` в корне проекта;
+  - таймаут вызова модели: через `MODEL_TIMEOUT_SECONDS` (по умолчанию `0`, без таймаута);
+  - все конфиги системы хранятся в этом же файле.
+- `llm_interface.py` — единый интерфейс подключения LLM backend для RAG и RAGAS judge.
+- `eval_rag.ipynb` — только запуск проверки через RAGAS по золотым вопросам.
+- `rag_eval/run_eval.py` — пайплайн оценки одной системы с расширенной диагностикой и HTML-отчётом.
 
 ## Структура
 
-- `data/` — Excel с вопросами
-- `rag_eval/` — код оценки и отчёта
-- `rag_systems.py` — реестр RAG и FAISS‑ретривер
-- `eval_rag.ipynb` — запуск
-- `vector_db/` — FAISS индекс и документы
-- `reports/` — отчёты (создаётся автоматически)
+- `data/` — золотые вопросы (xlsx)
+- `vector_db/` — векторная база (`index.faiss` + `docs.json` или `docs.jsonl`)
+- `rag_systems/` — файл проверяемой RAG-системы
+- `rag_eval/` — код запуска оценки
+- `eval_rag.ipynb` — точка запуска
+- `reports/` — результаты (создаются автоматически)
+
+Важно: файл `rag_systems.py` больше не используется, логика системы перенесена в `rag_systems/gigachat_bge_m3.py`.
 
 ## Запуск
 
-Откройте `eval_rag.ipynb` и выполните ячейки сверху вниз.
-
-## Форматы и типы данных
-
-### 1) Золотые вопросы (Excel)
-
-Файл в `data/` (например, `gold_questions.xlsx`).
-Колонки:
-- `question` (str, обяз.) — текст вопроса
-- `ground_truth` (str, опц.) — эталонный ответ
-
-Допускаются синонимы колонок, они будут нормализованы:
-- `question`: `query`, `q`, `вопрос`, `вопрос_пользователя`
-- `ground_truth`: `reference`, `answer_gt`, `эталон`, `эталонный_ответ`, `правильный_ответ`
-
-### 2) Векторная база (FAISS)
-
-Папка `vector_db/` рядом с проектом.
-Должны быть:
-- `index.faiss` — FAISS индекс
-- `docs.json` **или** `docs.jsonl` — тексты документов
-
-Структура папки:
-```
-vector_db/
-  index.faiss
-  docs.json            # или docs.jsonl
-```
-
-Формат `docs.json`:
-```json
-[
-  {
-    "id": "doc-001",
-    "text": "Полный текст документа или чанка",
-    "metadata": {
-      "source": "file.pdf",
-      "page": 12,
-      "title": "Документ"
-    }
-  }
-]
-```
-
-Формат `docs.jsonl`:
-```jsonl
-{"id": "doc-001", "text": "Полный текст документа или чанка", "metadata": {"source": "file.pdf", "page": 12}}
-{"id": "doc-002", "text": "Ещё один чанк", "metadata": {"source": "site", "url": "https://..."}}
-```
-
-Важно: порядок текстов в `docs.*` должен совпадать с порядком вектора в `index.faiss`.
-
-### 3) Ретривер и модели
-
-В `eval_rag.ipynb` задаются пути к локальным моделям:
-- `E5_MODEL_PATH`
-- `BGE3_MODEL_PATH`
-
-В `rag_systems.py` ретривер использует:
-- `VECTOR_DB_DIR` (по умолчанию `vector_db/`)
-- `RETRIEVER_TOP_K`
-
-Формат данных для ретривера:
-- вход: `query: str` (текст вопроса)
-- выход: `list[str]` (список текстов/чанков, которые пойдут в `contexts`)
-
-Как формировать индекс:
-- каждый элемент в `docs.*` соответствует одному вектору в `index.faiss`
-- обязательное поле: `text`
-- опциональные поля: `id`, `metadata` (любые ключи)
-
-Структура кода ретривера:
-```
-build_retriever(model_name, db_path)
-  -> faiss.read_index(...)
-  -> load docs.json / docs.jsonl
-  -> SentenceTransformer(model_path)
-  -> retrieve(query) -> list[str]
-```
+1. (Опционально) запустите KoboldCpp:
+   - `./koboldcpp --model ~/models/gguf/Phi-3.5-mini-instruct-IQ4_XS.gguf --port 5001`
+2. Выберите backend:
+   - `LLM_BACKEND=koboldcpp` или `LLM_BACKEND=gigachat`
+3. Для `koboldcpp` при необходимости задайте:
+   - `KOBOLDCPP_BASE_URL` (по умолчанию `http://127.0.0.1:5001/v1`)
+   - `KOBOLDCPP_API_KEY` (по умолчанию `koboldcpp`)
+   - `KOBOLDCPP_MODEL` (по умолчанию `koboldcpp`)
+4. Убедитесь, что в `vector_db/` есть:
+   - `index.faiss`
+   - `docs.json` или `docs.jsonl` (поле `text`)
+5. Убедитесь, что `data/*.xlsx` содержит колонку `question` (и опционально `ground_truth`).
+6. Откройте `eval_rag.ipynb` и выполните ячейки сверху вниз.
 
 ## Отчёт
 
-HTML‑отчёт лежит в `reports/<run_id>/`.
-Секция **Config** показывает параметры ретривера из ноутбука.
+После каждого запуска в `reports/<timestamp>_<run_name>/` сохраняются:
+
+- `scores.csv` — полный построчный результат: RAGAS-метрики + runtime + retrieval + bge-m3 диагностика.
+- `scores_compact.csv` — сокращённый построчный вид для быстрого просмотра.
+- `summary.csv` — общий агрегированный summary по всем числовым колонкам.
+- `summary_ragas.csv` — агрегаты только по RAGAS-метрикам.
+- `summary_bge_m3.csv` — агрегаты только по дополнительным bge-m3 метрикам.
+- `summary_runtime.csv` — агрегаты по времени/размерам ответа/количеству контекстов.
+- `config.csv` — все фактические параметры запуска (модель, endpoint, timeout, top_k и т.д.).
+- `parameter_guide.csv` — краткая расшифровка метрик и параметров.
+- `run_meta.json` — машинно-читаемые метаданные запуска.
+- `report.html` — итоговый человеко-читаемый дашборд по запуску.
+
+## Как читать параметры
+
+- Сначала смотрите `report.html`: там сводка, худшие кейсы и медленные кейсы.
+- Для воспроизводимости запускайте `config.csv` и `run_meta.json`: в них полный конфиг RAG/LLM/judge и тайминги.
+- Для сравнения качества:
+  - `summary_ragas.csv` — judge-оценка ответа;
+  - `summary_bge_m3.csv` — независимое семантическое сравнение на локальном `bge-m3`.
+- Для анализа по вопросам используйте `scores_compact.csv`, а если нужен полный контекст — `scores.csv`.
+
+## Примечания
+
+- Выполнение сделано последовательно (один поток через `RunConfig(max_workers=1)`).
+- Для изолированного локального запуска:
+  - `ISOLATED_LOCAL_ONLY=1` (по умолчанию) разрешает только `LLM_BACKEND=koboldcpp`
+  - `GOLD_LIMIT=3` (по умолчанию) — быстрый smoke-прогон по первым 3 вопросам; `GOLD_LIMIT=0` — полный gold
+  - `JUDGE_TIMEOUT_SECONDS=0` (по умолчанию) отключает таймаут judge-запросов
+  - `MODEL_TIMEOUT_SECONDS=0` (по умолчанию) отключает таймаут генерации в RAG-системе
+  - `RAGAS_TIMEOUT_SECONDS=1800` (по умолчанию) — таймаут задач метрик RAGAS
+- `answer_relevancy` считается только при переданном `judge_embeddings`; в ноутбуке по умолчанию используются локальные HuggingFace-embeddings (`LOCAL_EMBED_MODEL_PATH`).
+- Один `LLM_BACKEND` в ноутбуке используется сразу для двух частей:
+  - генерация ответов в проверяемой RAG-системе;
+  - judge-модель для расчёта метрик RAGAS.
