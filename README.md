@@ -19,7 +19,7 @@
   - ретривер на локальной `bge-m3` (`/home/vladislav/models/bge-m3`);
   - чтение FAISS базы из `vector_db/` в корне проекта;
   - таймаут вызова модели: через `MODEL_TIMEOUT_SECONDS` (по умолчанию `0`, без таймаута);
-  - все конфиги системы хранятся в этом же файле.
+  - конфиг собирается через `RagSystemConfig` (из env через `load_config_from_env`).
 - `llm_interface.py` — единый интерфейс подключения LLM backend для RAG и RAGAS judge.
 - `eval_rag.ipynb` — только запуск проверки через RAGAS по золотым вопросам.
 - `rag_eval/run_eval.py` — пайплайн оценки одной системы с расширенной диагностикой и HTML-отчётом.
@@ -78,13 +78,14 @@
 ## Примечания
 
 - Выполнение сделано последовательно (один поток через `RunConfig(max_workers=1)`).
+- По умолчанию включен экономный режим: один shared `LLM` и один shared `bge-m3` для RAG и RAGAS (`run_single_rag_eval(..., use_shared_rag_system_models=True)`).
+- Если нужен отдельный judge, отключите shared-режим: `run_single_rag_eval(..., use_shared_rag_system_models=False, judge_llm=..., judge_embeddings=...)`.
 - Для изолированного локального запуска:
   - `ISOLATED_LOCAL_ONLY=1` (по умолчанию) разрешает только `LLM_BACKEND=koboldcpp`
   - `GOLD_LIMIT=3` (по умолчанию) — быстрый smoke-прогон по первым 3 вопросам; `GOLD_LIMIT=0` — полный gold
-  - `JUDGE_TIMEOUT_SECONDS=0` (по умолчанию) отключает таймаут judge-запросов
   - `MODEL_TIMEOUT_SECONDS=0` (по умолчанию) отключает таймаут генерации в RAG-системе
   - `RAGAS_TIMEOUT_SECONDS=1800` (по умолчанию) — таймаут задач метрик RAGAS
-- `answer_relevancy` считается только при переданном `judge_embeddings`; в ноутбуке по умолчанию используются локальные HuggingFace-embeddings (`LOCAL_EMBED_MODEL_PATH`).
-- Один `LLM_BACKEND` в ноутбуке используется сразу для двух частей:
+- `answer_relevancy` считается при наличии `judge_embeddings`; в экономном режиме они берутся из shared `bge-m3` ретривера автоматически.
+- Один `LLM_BACKEND` используется сразу для двух частей (через один объект LLM):
   - генерация ответов в проверяемой RAG-системе;
   - judge-модель для расчёта метрик RAGAS.

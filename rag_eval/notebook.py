@@ -8,11 +8,12 @@ from .run_eval import run_single_rag_eval
 def run_eval_notebook(
     gold_path: str,
     rag_system,
-    judge_llm,
+    judge_llm=None,
     judge_embeddings=None,
     ragas_run_config=None,
     reports_dir: str = "reports",
     run_name: str = "rag",
+    use_shared_rag_system_models: bool = True,
 ):
     return run_single_rag_eval(
         gold_path=gold_path,
@@ -22,6 +23,7 @@ def run_eval_notebook(
         ragas_run_config=ragas_run_config,
         reports_dir=reports_dir,
         run_name=run_name,
+        use_shared_rag_system_models=use_shared_rag_system_models,
     )
 
 

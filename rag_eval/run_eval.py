@@ -15,7 +15,6 @@ Outputs:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -45,19 +44,45 @@ except Exception:
     LangchainEmbeddingsWrapper = None
 
 
-DEFAULT_BGE_M3_MODEL_PATH = os.environ.get("RAG_EVAL_BGE_M3_MODEL_PATH", "/home/vladislav/models/bge-m3")
-DEFAULT_BGE_M3_DEVICE = os.environ.get(
-    "RAG_EVAL_BGE_M3_DEVICE",
-    os.environ.get("EMBEDDING_DEVICE", "cpu"),
-).strip().lower()
 TEXT_PREVIEW_LIMIT = 260
 _TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
 
 
-@dataclass
 class RagResponse:
-    answer: str
-    contexts: list[str]
+    def __init__(self, answer: str, contexts: list[str]) -> None:
+        self.answer = answer
+        self.contexts = contexts
+
+
+class SentenceTransformerEmbeddingsAdapter:
+    """LangChain-compatible embeddings over a preloaded SentenceTransformer."""
+
+    def __init__(self, embedder: SentenceTransformer, device: str) -> None:
+        self._embedder = embedder
+        self._device = device
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        vectors = self._embedder.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            device=self._device,
+        )
+        return vectors.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        vectors = self.embed_documents([text])
+        return vectors[0] if vectors else []
+
+
+def _default_bge_model_path() -> str:
+    return os.environ.get("RAG_EVAL_BGE_M3_MODEL_PATH", "/home/vladislav/models/bge-m3")
+
+
+def _default_bge_device() -> str:
+    return os.environ.get("RAG_EVAL_BGE_M3_DEVICE", os.environ.get("EMBEDDING_DEVICE", "cpu")).strip().lower()
 
 
 def adapt_response(raw) -> RagResponse:
@@ -74,6 +99,80 @@ def adapt_response(raw) -> RagResponse:
         return RagResponse(answer=str(answer), contexts=list(contexts))
 
     raise TypeError("Unsupported RAG response format")
+
+
+def _extract_shared_chat_model(rag_system):
+    getter = getattr(rag_system, "get_chat_model", None)
+    if callable(getter):
+        return getter()
+    return getattr(rag_system, "_llm", None)
+
+
+def _extract_shared_sentence_embedder(rag_system):
+    getter = getattr(rag_system, "get_sentence_embedder", None)
+    if callable(getter):
+        return getter()
+
+    retriever = getattr(rag_system, "_retriever", None)
+    if retriever is None:
+        return None
+    return getattr(retriever, "_embedder", None)
+
+
+def _extract_shared_embedding_device(rag_system) -> str | None:
+    getter = getattr(rag_system, "get_embedding_device", None)
+    if callable(getter):
+        value = getter()
+        if value is not None:
+            return str(value)
+
+    retriever = getattr(rag_system, "_retriever", None)
+    if retriever is None:
+        return None
+    value = getattr(retriever, "_embedding_device", None)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _extract_shared_embedding_model_path(rag_system) -> str | None:
+    getter = getattr(rag_system, "get_embedding_model_path", None)
+    if callable(getter):
+        value = getter()
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _resolve_judge_llm(judge_llm, rag_system):
+    if judge_llm is not None:
+        return judge_llm
+
+    shared_llm = _extract_shared_chat_model(rag_system)
+    if shared_llm is None:
+        raise ValueError("judge_llm не передан и в rag_system не найден LLM.")
+    if LangchainLLMWrapper is None:
+        return shared_llm
+    return LangchainLLMWrapper(shared_llm)
+
+
+def _resolve_judge_embeddings(judge_embeddings, rag_system):
+    if judge_embeddings is not None:
+        return judge_embeddings
+    if LangchainEmbeddingsWrapper is None:
+        return None
+
+    embedder = _extract_shared_sentence_embedder(rag_system)
+    if embedder is None:
+        return None
+    device = _extract_shared_embedding_device(rag_system) or _default_bge_device()
+    return LangchainEmbeddingsWrapper(SentenceTransformerEmbeddingsAdapter(embedder, device))
+
+
+def build_shared_judges_from_rag_system(rag_system) -> tuple[t.Any, t.Any]:
+    judge_llm = _resolve_judge_llm(None, rag_system)
+    judge_embeddings = _resolve_judge_embeddings(None, rag_system)
+    return judge_llm, judge_embeddings
 
 
 def _normalize_gold(df: pd.DataFrame) -> pd.DataFrame:
@@ -247,23 +346,29 @@ def _mean(values: list[float]) -> float | None:
 def compute_bge_m3_diagnostics(
     eval_df: pd.DataFrame,
     *,
-    model_path: str = DEFAULT_BGE_M3_MODEL_PATH,
-    device: str = DEFAULT_BGE_M3_DEVICE,
+    model_path: str | None = None,
+    device: str | None = None,
+    embedder: SentenceTransformer | None = None,
 ) -> tuple[pd.DataFrame, dict[str, t.Any]]:
+    resolved_model_path = model_path or _default_bge_model_path()
+    resolved_device = (device or _default_bge_device() or "cpu").strip().lower()
     diag_meta: dict[str, t.Any] = {
         "enabled": False,
-        "model_path": model_path,
-        "device": device,
+        "model_path": resolved_model_path,
+        "device": resolved_device,
         "error": None,
+        "reused_embedder": embedder is not None,
     }
     if eval_df.empty:
         return pd.DataFrame(index=eval_df.index), diag_meta
 
-    try:
-        embedder = SentenceTransformer(model_path, device=device or "cpu")
-    except Exception as exc:
-        diag_meta["error"] = str(exc)
-        return pd.DataFrame(index=eval_df.index), diag_meta
+    resolved_embedder = embedder
+    if resolved_embedder is None:
+        try:
+            resolved_embedder = SentenceTransformer(resolved_model_path, device=resolved_device or "cpu")
+        except Exception as exc:
+            diag_meta["error"] = str(exc)
+            return pd.DataFrame(index=eval_df.index), diag_meta
 
     unique_texts: list[str] = []
     text_to_idx: dict[str, int] = {}
@@ -290,11 +395,11 @@ def compute_bge_m3_diagnostics(
             }
         )
 
-    embeddings = embedder.encode(
+    embeddings = resolved_embedder.encode(
         unique_texts,
         normalize_embeddings=True,
         convert_to_numpy=True,
-        device=device or "cpu",
+        device=resolved_device or "cpu",
     ).astype("float32")
 
     diag_meta["enabled"] = True
@@ -397,6 +502,16 @@ def _extract_rag_system_config(rag_system) -> dict[str, t.Any]:
         "rag_system_module": type(rag_system).__module__,
     }
 
+    getter = getattr(rag_system, "get_system_config", None)
+    if callable(getter):
+        try:
+            raw = getter()
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    config[f"rag_system_{key}"] = value
+        except Exception:
+            pass
+
     backend = getattr(rag_system, "_llm_backend", None)
     if backend is not None:
         config["rag_llm_backend"] = backend
@@ -413,25 +528,6 @@ def _extract_rag_system_config(rag_system) -> dict[str, t.Any]:
         texts = getattr(retriever, "_texts", None)
         if isinstance(texts, list):
             config["retriever_docs_count"] = len(texts)
-
-    try:
-        module = __import__(type(rag_system).__module__, fromlist=["*"])
-        for key in [
-            "RETRIEVER_TOP_K",
-            "MODEL_TIMEOUT_SECONDS",
-            "EMBEDDING_MODEL_PATH",
-            "EMBEDDING_DEVICE",
-            "KOBOLDCPP_BASE_URL",
-            "KOBOLDCPP_MODEL",
-            "KOBOLDCPP_TEMPERATURE",
-            "KOBOLDCPP_MAX_TOKENS",
-            "KOBOLDCPP_MAX_RETRIES",
-            "GIGACHAT_MODEL",
-        ]:
-            if hasattr(module, key):
-                config[f"rag_module_{key.lower()}"] = getattr(module, key)
-    except Exception:
-        pass
 
     return config
 
@@ -461,6 +557,7 @@ def _config_description_map() -> dict[str, str]:
         "run_name": "Имя запуска/системы в отчете.",
         "gold_path": "Путь к XLSX с золотыми вопросами.",
         "rows": "Количество вопросов, обработанных в прогоне.",
+        "use_shared_rag_system_models": "Использовать один общий LLM/BGE из rag_system для RAG и RAGAS.",
         "ragas_run_timeout": "Таймаут одной задачи RAGAS в секундах.",
         "ragas_max_workers": "Параллелизм RAGAS (для последовательного режима держите 1).",
         "ragas_metrics": "Набор метрик RAGAS в этом запуске.",
@@ -469,12 +566,16 @@ def _config_description_map() -> dict[str, str]:
         "rag_llm_model_name": "Модель LLM внутри проверяемого RAG.",
         "rag_llm_openai_api_base": "Endpoint LLM проверяемого RAG.",
         "retriever_docs_count": "Количество документов/чанков в FAISS-хранилище.",
-        "rag_module_retriever_top_k": "Сколько контекстов возвращает ретривер.",
-        "rag_module_model_timeout_seconds": "Таймаут генерации в проверяемом RAG (0 = без лимита).",
+        "rag_system_retriever_docs_count": "Количество документов/чанков в FAISS-хранилище.",
+        "rag_system_retriever_top_k": "Сколько контекстов возвращает ретривер.",
+        "rag_system_embedding_model_path": "Путь к модели эмбеддингов внутри RAG-системы.",
+        "rag_system_embedding_device": "Устройство эмбеддингов внутри RAG-системы.",
+        "rag_system_llm_backend": "Backend LLM внутри RAG-системы (gigachat/koboldcpp).",
         "bge_m3_enabled": "Удалось ли включить bge-m3 диагностику.",
         "bge_m3_model_path": "Путь к модели bge-m3 для сравнений.",
         "bge_m3_device": "Устройство для bge-m3 (cpu/cuda).",
         "bge_m3_unique_texts_embedded": "Сколько уникальных строк было закодировано bge-m3.",
+        "bge_m3_reused_embedder": "Диагностика использовала уже загруженный embedder без повторной загрузки.",
         "rag_total_generation_sec": "Суммарное время генерации ответов RAG (сек).",
         "rag_avg_generation_sec": "Среднее время генерации одного ответа RAG (сек).",
         "ragas_total_eval_sec": "Суммарное время вычисления метрик RAGAS (сек).",
@@ -969,11 +1070,12 @@ def build_html_report(
 def run_single_rag_eval(
     gold_path: str | Path,
     rag_system,
-    judge_llm,
+    judge_llm=None,
     judge_embeddings=None,
     ragas_run_config=None,
     reports_dir: str | Path = "reports",
     run_name: str = "rag",
+    use_shared_rag_system_models: bool = True,
 ) -> Path:
     run_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = Path(reports_dir) / f"{run_stamp}_{run_name}"
@@ -981,10 +1083,16 @@ def run_single_rag_eval(
 
     gold_df = load_xlsx(gold_path)
     eval_df = run_rag_over_questions(gold_df, rag_system)
+    if use_shared_rag_system_models:
+        resolved_judge_llm = _resolve_judge_llm(None, rag_system)
+        resolved_judge_embeddings = _resolve_judge_embeddings(None, rag_system)
+    else:
+        resolved_judge_llm = _resolve_judge_llm(judge_llm, rag_system)
+        resolved_judge_embeddings = _resolve_judge_embeddings(judge_embeddings, rag_system)
     scores_df, ragas_elapsed = evaluate_with_ragas(
         eval_df,
-        judge_llm=judge_llm,
-        judge_embeddings=judge_embeddings,
+        judge_llm=resolved_judge_llm,
+        judge_embeddings=resolved_judge_embeddings,
         ragas_run_config=ragas_run_config,
     )
 
@@ -1002,7 +1110,13 @@ def run_single_rag_eval(
         if col not in scores_df.columns:
             scores_df[col] = eval_df[col]
 
-    diag_df, diag_meta = compute_bge_m3_diagnostics(eval_df)
+    shared_embedder = _extract_shared_sentence_embedder(rag_system)
+    diag_df, diag_meta = compute_bge_m3_diagnostics(
+        eval_df,
+        model_path=_extract_shared_embedding_model_path(rag_system),
+        device=_extract_shared_embedding_device(rag_system),
+        embedder=shared_embedder,
+    )
     if not diag_df.empty:
         scores_df = scores_df.join(diag_df)
 
@@ -1035,7 +1149,7 @@ def run_single_rag_eval(
     summary_bge_df.to_csv(run_dir / "summary_bge_m3.csv", index=False)
     summary_runtime_df.to_csv(run_dir / "summary_runtime.csv", index=False)
 
-    judge_inner_llm = _extract_langchain_llm(judge_llm)
+    judge_inner_llm = _extract_langchain_llm(resolved_judge_llm)
     config = {
         "run_name": run_name,
         "gold_path": str(Path(gold_path).resolve()),
@@ -1046,11 +1160,13 @@ def run_single_rag_eval(
         "rag_total_generation_sec": float(eval_df["rag_answer_latency_sec"].sum()) if "rag_answer_latency_sec" in eval_df else None,
         "rag_avg_generation_sec": float(eval_df["rag_answer_latency_sec"].mean()) if "rag_answer_latency_sec" in eval_df else None,
         "ragas_total_eval_sec": float(ragas_elapsed),
+        "use_shared_rag_system_models": bool(use_shared_rag_system_models),
         "bge_m3_enabled": diag_meta.get("enabled", False),
         "bge_m3_model_path": diag_meta.get("model_path"),
         "bge_m3_device": diag_meta.get("device"),
         "bge_m3_unique_texts_embedded": diag_meta.get("unique_texts_embedded"),
         "bge_m3_error": diag_meta.get("error"),
+        "bge_m3_reused_embedder": diag_meta.get("reused_embedder"),
     }
     config.update(_extract_llm_config("judge_llm", judge_inner_llm))
     config.update(_extract_rag_system_config(rag_system))
@@ -1100,6 +1216,7 @@ def run_single_rag_eval(
             "device": diag_meta.get("device"),
             "error": diag_meta.get("error"),
             "unique_texts_embedded": diag_meta.get("unique_texts_embedded"),
+            "reused_embedder": bool(diag_meta.get("reused_embedder", False)),
         },
         "timings_sec": {
             "rag_total_generation": config.get("rag_total_generation_sec"),
@@ -1118,6 +1235,7 @@ def run_single_rag_eval(
 __all__ = [
     "LangchainEmbeddingsWrapper",
     "LangchainLLMWrapper",
+    "build_shared_judges_from_rag_system",
     "latest_xlsx",
     "run_single_rag_eval",
 ]
