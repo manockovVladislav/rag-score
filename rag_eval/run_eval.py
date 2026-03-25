@@ -557,7 +557,7 @@ def _config_description_map() -> dict[str, str]:
         "run_name": "Имя запуска/системы в отчете.",
         "gold_path": "Путь к XLSX с золотыми вопросами.",
         "rows": "Количество вопросов, обработанных в прогоне.",
-        "use_shared_rag_system_models": "Использовать один общий LLM/BGE из rag_system для RAG и RAGAS.",
+        "use_shared_rag_system_models": "Использовать один общий LLM/векторизатор из rag_system для RAG и RAGAS.",
         "ragas_run_timeout": "Таймаут одной задачи RAGAS в секундах.",
         "ragas_max_workers": "Параллелизм RAGAS (для последовательного режима держите 1).",
         "ragas_metrics": "Набор метрик RAGAS в этом запуске.",
@@ -571,11 +571,11 @@ def _config_description_map() -> dict[str, str]:
         "rag_system_embedding_model_path": "Путь к модели эмбеддингов внутри RAG-системы.",
         "rag_system_embedding_device": "Устройство эмбеддингов внутри RAG-системы.",
         "rag_system_llm_backend": "Backend LLM внутри RAG-системы (gigachat/koboldcpp).",
-        "bge_m3_enabled": "Удалось ли включить bge-m3 диагностику.",
-        "bge_m3_model_path": "Путь к модели bge-m3 для сравнений.",
-        "bge_m3_device": "Устройство для bge-m3 (cpu/cuda).",
-        "bge_m3_unique_texts_embedded": "Сколько уникальных строк было закодировано bge-m3.",
-        "bge_m3_reused_embedder": "Диагностика использовала уже загруженный embedder без повторной загрузки.",
+        "bge_m3_enabled": "Удалось ли включить диагностику векторизатора.",
+        "bge_m3_model_path": "Путь к модели векторизатора для сравнений.",
+        "bge_m3_device": "Устройство для векторизатора (cpu/cuda).",
+        "bge_m3_unique_texts_embedded": "Сколько уникальных строк было закодировано векторизатором.",
+        "bge_m3_reused_embedder": "Диагностика использовала уже загруженный векторизатор без повторной загрузки.",
         "rag_total_generation_sec": "Суммарное время генерации ответов RAG (сек).",
         "rag_avg_generation_sec": "Среднее время генерации одного ответа RAG (сек).",
         "ragas_total_eval_sec": "Суммарное время вычисления метрик RAGAS (сек).",
@@ -619,18 +619,18 @@ def _build_parameter_guide_df() -> pd.DataFrame:
             "how_to_read": "Насколько ответ релевантен вопросу (требует embeddings). Выше = лучше.",
         },
         {
-            "metric_or_param": "bge_question_answer_cosine",
-            "type": "bge-m3",
-            "how_to_read": "Семантическая близость вопроса и ответа по bge-m3. Выше = обычно лучше.",
+            "metric_or_param": "Векторизатор_question_answer_cosine",
+            "type": "векторизатор",
+            "how_to_read": "Семантическая близость вопроса и ответа по векторизатору. Выше = обычно лучше.",
         },
         {
-            "metric_or_param": "bge_answer_ground_truth_cosine",
-            "type": "bge-m3",
+            "metric_or_param": "Векторизатор_answer_ground_truth_cosine",
+            "type": "векторизатор",
             "how_to_read": "Семантическая близость ответа и ground_truth. Выше = лучше.",
         },
         {
-            "metric_or_param": "bge_context_question_max_cosine",
-            "type": "bge-m3",
+            "metric_or_param": "Векторизатор_context_question_max_cosine",
+            "type": "векторизатор",
             "how_to_read": "Лучший retrieved context к вопросу. Низкое значение указывает на слабый retrieval.",
         },
         {
@@ -671,6 +671,19 @@ def _metric_description_map() -> dict[str, str]:
     return mapping
 
 
+def _display_metric_name(name: str) -> str:
+    value = str(name)
+    if "bge_m3" in value:
+        value = value.replace("bge_m3", "vectorizer")
+    if value.startswith("vectorizer_"):
+        return "Векторизатор_" + value[len("vectorizer_") :]
+    if value.startswith("bge_m3_"):
+        return "Векторизатор_" + value[len("bge_m3_") :]
+    if value.startswith("bge_"):
+        return "Векторизатор_" + value[len("bge_") :]
+    return value
+
+
 def _format_numeric_for_html(df: pd.DataFrame) -> pd.DataFrame:
     view = df.copy()
     for col in view.columns:
@@ -683,6 +696,10 @@ def _to_html_table(df: pd.DataFrame, *, max_rows: int | None = None) -> str:
     if df.empty:
         return "<p>Нет данных</p>"
     view = _format_numeric_for_html(df)
+    for metric_col in ("metric", "parameter", "metric_or_param"):
+        if metric_col in view.columns:
+            view[metric_col] = view[metric_col].map(lambda x: _display_metric_name(str(x)))
+    view = view.rename(columns={col: _display_metric_name(str(col)) for col in view.columns})
     if max_rows is not None:
         view = view.head(max_rows)
     return view.to_html(index=False, escape=True, classes="table table-sm table-striped", border=0)
@@ -696,9 +713,13 @@ def _metric_legend_html(df: pd.DataFrame) -> str:
     metric_names: list[str] = []
 
     if "metric" in df.columns:
-        metric_names.extend(str(value) for value in df["metric"].dropna().tolist())
+        metric_names.extend(_display_metric_name(str(value)) for value in df["metric"].dropna().tolist())
 
-    metric_names.extend(str(column) for column in df.columns if str(column) in descriptions)
+    metric_names.extend(
+        _display_metric_name(str(column))
+        for column in df.columns
+        if _display_metric_name(str(column)) in descriptions
+    )
 
     unique_metrics: list[str] = []
     seen: set[str] = set()
@@ -766,6 +787,45 @@ def _compute_health_score(scores_df: pd.DataFrame) -> dict[str, t.Any]:
     return {"score_100": score_100, "status": status[0], "status_ru": status[1], "used": used}
 
 
+def _ragas_alerts_html(scores_df: pd.DataFrame) -> str:
+    alerts: list[str] = []
+
+    if "faithfulness" in scores_df.columns:
+        faith = pd.to_numeric(scores_df["faithfulness"], errors="coerce")
+        if faith.notna().sum() == 0:
+            alerts.append(
+                "faithfulness не рассчиталась (все значения NaN). "
+                "Обычно это значит, что judge-модель не дала стабильный структурированный ответ для этой метрики."
+            )
+
+    if "context_precision" in scores_df.columns:
+        precision = pd.to_numeric(scores_df["context_precision"], errors="coerce").dropna()
+        if not precision.empty and float(precision.max()) == 0.0:
+            alerts.append(
+                "context_precision = 0 по всем строкам: retrieved_contexts нерелевантны эталону "
+                "или корпус не покрывает вопросы."
+            )
+
+    if "context_recall" in scores_df.columns:
+        recall = pd.to_numeric(scores_df["context_recall"], errors="coerce").dropna()
+        if not recall.empty and float(recall.max()) == 0.0:
+            alerts.append(
+                "context_recall = 0 по всем строкам: retrieved_contexts не содержат информацию из ground_truth."
+            )
+
+    if not alerts:
+        return ""
+
+    items = "".join(f"<li>{escape(item)}</li>" for item in alerts)
+    return (
+        '<div class="card">'
+        "<h2>Metric Alerts</h2>"
+        '<p class="section-note">Автоматические предупреждения по метрикам текущего запуска.</p>'
+        f"<ul>{items}</ul>"
+        "</div>"
+    )
+
+
 def _health_details_html(payload: dict[str, t.Any]) -> str:
     used = payload.get("used") or []
     if not used:
@@ -773,7 +833,7 @@ def _health_details_html(payload: dict[str, t.Any]) -> str:
 
     items = "".join(
         (
-            f"<li><span class=\"code\">{escape(str(item['metric']))}</span>: "
+            f"<li><span class=\"code\">{escape(_display_metric_name(str(item['metric'])))}</span>: "
             f"mean={float(item['mean']):.3f}, weight={float(item['weight']):.1f}</li>"
         )
         for item in used
@@ -837,9 +897,8 @@ def build_html_report(
 ) -> Path:
     created_at = datetime.now(timezone.utc).isoformat()
     health = _compute_health_score(scores_df)
+    ragas_alerts_html = _ragas_alerts_html(scores_df)
     health_score = health["score_100"]
-    health_status = str(health["status"])
-    health_status_ru = str(health["status_ru"])
     health_score_text = f"{health_score:.1f}" if health_score is not None else "n/a"
 
     dashboard_df = _build_display_table(scores_df)
@@ -938,36 +997,6 @@ def build_html_report(
       color: #51617f;
       margin-left: 6px;
     }}
-    .health-badge {{
-      display: inline-block;
-      border-radius: 999px;
-      padding: 4px 10px;
-      font-size: 13px;
-      font-weight: 600;
-      border: 1px solid #cfd8ea;
-      background: #eef3ff;
-      color: #1f3f7f;
-    }}
-    .health-badge.excellent {{
-      background: #eaf9ee;
-      border-color: #b8e3c4;
-      color: #1d6b38;
-    }}
-    .health-badge.good {{
-      background: #eef7ff;
-      border-color: #c5dff7;
-      color: #1f4f8a;
-    }}
-    .health-badge.warning {{
-      background: #fff8e8;
-      border-color: #f1ddab;
-      color: #8a6200;
-    }}
-    .health-badge.critical {{
-      background: #fff0f0;
-      border-color: #efc2c2;
-      color: #8f1d1d;
-    }}
     .code {{
       font-family: Consolas, "Liberation Mono", monospace;
       background: #f1f5f9;
@@ -985,10 +1014,11 @@ def build_html_report(
     <p class="section-note">Единый индикатор состояния RAG по ключевым quality-метрикам. 100 = максимально хорошо, 0 = критически плохо.</p>
     <div class="health">
       <div class="health-score">{escape(health_score_text)}<span class="health-scale">/100</span></div>
-      <div class="health-badge {escape(health_status)}">{escape(health_status_ru)}</div>
     </div>
     {_health_details_html(health)}
   </div>
+
+  {ragas_alerts_html}
 
   <div class="card">
     <h2>Summary (RAGAS)</h2>
@@ -1026,7 +1056,7 @@ def build_html_report(
   </div>
 
   <div class="card">
-    <h2>Summary (BGE-M3 Diagnostics)</h2>
+    <h2>Сводка (Диагностика векторизатора)</h2>
     <p class="section-note">Сводка по дополнительным диагностическим метрикам на эмбеддингах и лексическом пересечении.</p>
     {_to_html_table(summary_bge_df)}
     {_metric_legend_html(summary_bge_df)}
@@ -1055,7 +1085,7 @@ def build_html_report(
     <h2>Artifacts</h2>
     <p class="section-note">Список файлов, которые были сохранены для этого прогона.</p>
     <ul class="files">
-      {''.join(f'<li>{escape(name)}</li>' for name in artifacts)}
+      {''.join(f'<li>{escape(_display_metric_name(name))}</li>' for name in artifacts)}
     </ul>
   </div>
 </body>
@@ -1146,6 +1176,7 @@ def run_single_rag_eval(
     compact_df.to_csv(run_dir / "scores_compact.csv", index=False)
     summary_df.to_csv(run_dir / "summary.csv", index=False)
     summary_ragas_df.to_csv(run_dir / "summary_ragas.csv", index=False)
+    summary_bge_df.to_csv(run_dir / "summary_vectorizer.csv", index=False)
     summary_bge_df.to_csv(run_dir / "summary_bge_m3.csv", index=False)
     summary_runtime_df.to_csv(run_dir / "summary_runtime.csv", index=False)
 
@@ -1182,7 +1213,7 @@ def run_single_rag_eval(
         "scores_compact.csv",
         "summary.csv",
         "summary_ragas.csv",
-        "summary_bge_m3.csv",
+        "summary_vectorizer.csv",
         "summary_runtime.csv",
         "config.csv",
         "parameter_guide.csv",

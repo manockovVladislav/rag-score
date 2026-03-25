@@ -21,6 +21,8 @@ def normalize_backend_name(name: str) -> str:
         "giga": "gigachat",
         "koboldcpp": "koboldcpp",
         "kobold": "koboldcpp",
+        "cobold": "koboldcpp",
+        "cobolt": "koboldcpp",
         "koboltcpp": "koboldcpp",
         "kobalt": "koboldcpp",
         "cobalt": "koboldcpp",

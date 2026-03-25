@@ -20,6 +20,11 @@
   - чтение FAISS базы из `vector_db/` в корне проекта;
   - таймаут вызова модели: через `MODEL_TIMEOUT_SECONDS` (по умолчанию `0`, без таймаута);
   - конфиг собирается через `RagSystemConfig` (из env через `load_config_from_env`).
+- `rag_systems/gigachat_multilingual_e5_large.py` — альтернативная система:
+  - генерация через те же backend (`gigachat` или `koboldcpp`/`cobold`/`cobolt`);
+  - ретривер на `multilingual-e5-large` (с e5-форматом `passage:`/`query:`);
+  - чтение FAISS базы из `E5_VECTOR_DB_DIR` (по умолчанию `vector_db_e5_large/`);
+  - отдельные env-переменные: `E5_EMBEDDING_MODEL_PATH`, `E5_EMBEDDING_DEVICE`, `E5_RETRIEVER_TOP_K`.
 - `llm_interface.py` — единый интерфейс подключения LLM backend для RAG и RAGAS judge.
 - `eval_rag.ipynb` — только запуск проверки через RAGAS по золотым вопросам.
 - `rag_eval/run_eval.py` — пайплайн оценки одной системы с расширенной диагностикой и HTML-отчётом.
@@ -31,6 +36,7 @@
 - `rag_systems/` — файл проверяемой RAG-системы
 - `rag_eval/` — код запуска оценки
 - `eval_rag.ipynb` — точка запуска
+- `build_vector_db_e5_large.ipynb` — сборка FAISS базы именно для `multilingual-e5-large`
 - `reports/` — результаты (создаются автоматически)
 
 Важно: файл `rag_systems.py` больше не используется, логика системы перенесена в `rag_systems/gigachat_bge_m3.py`.
