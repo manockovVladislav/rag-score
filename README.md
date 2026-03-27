@@ -25,9 +25,11 @@
   - ретривер на `multilingual-e5-large` (с e5-форматом `passage:`/`query:`);
   - чтение FAISS базы из `E5_VECTOR_DB_DIR` (по умолчанию `vector_db_e5_large/`);
   - отдельные env-переменные: `E5_EMBEDDING_MODEL_PATH`, `E5_EMBEDDING_DEVICE`, `E5_RETRIEVER_TOP_K`.
-- `llm_interface.py` — единый интерфейс подключения LLM backend для RAG и RAGAS judge.
+- `llm_core/llm_interface.py` — единый интерфейс подключения LLM backend для RAG и RAGAS judge.
+- `llm_core/runtime_control.py` — общий throttling (`>6s`) и простой runtime-лог для GigaChat.
 - `eval_rag.ipynb` — только запуск проверки через RAGAS по золотым вопросам.
-- `rag_eval/run_eval.py` — пайплайн оценки одной системы с расширенной диагностикой и HTML-отчётом.
+- `rag_eval/run_eval.py` — пайплайн оценки одной системы с расширенной диагностикой.
+- `rag_eval/report_builder.py` — генерация HTML-отчёта.
 
 ## Структура
 
@@ -90,6 +92,9 @@
   - `ISOLATED_LOCAL_ONLY=1` (по умолчанию) разрешает только `LLM_BACKEND=koboldcpp`
   - `GOLD_LIMIT=3` (по умолчанию) — быстрый smoke-прогон по первым 3 вопросам; `GOLD_LIMIT=0` — полный gold
   - `MODEL_TIMEOUT_SECONDS=0` (по умолчанию) отключает таймаут генерации в RAG-системе
+  - `GIGACHAT_MIN_INTERVAL_SECONDS=6.1` — гарантированный интервал между запросами к GigaChat
+  - `GIGACHAT_DEBUG_LOG=1` — простой лог этапов/запросов с временем
+  - параметры GigaChat: `GIGACHAT_BASE_URL`, `GIGACHAT_API_TOKEN`, `GIGACHAT_MODEL_NAME`
   - `RAGAS_TIMEOUT_SECONDS=1800` (по умолчанию) — таймаут задач метрик RAGAS
 - `answer_relevancy` считается при наличии `judge_embeddings`; в экономном режиме они берутся из shared `bge-m3` ретривера автоматически.
 - Один `LLM_BACKEND` используется сразу для двух частей (через один объект LLM):

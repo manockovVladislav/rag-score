@@ -35,6 +35,20 @@ from ragas.metrics import (
     context_recall,
 )
 from sentence_transformers import SentenceTransformer
+from llm_core.runtime_control import (
+    ensure_gigachat_gap,
+    gigachat_min_interval_seconds,
+    is_gigachat_model,
+    log_runtime_event,
+    request_source,
+)
+
+try:
+    from .report_builder import build_display_table as report_build_display_table
+    from .report_builder import build_html_report as report_build_html_report
+except Exception:  # pragma: no cover - fallback for direct script imports
+    from rag_eval.report_builder import build_display_table as report_build_display_table
+    from rag_eval.report_builder import build_html_report as report_build_html_report
 
 try:
     from ragas.llms import LangchainLLMWrapper
@@ -49,19 +63,41 @@ _TOKEN_RE = re.compile(r"\w+", flags=re.UNICODE)
 
 
 class RagResponse:
+    """Унифицированный формат ответа RAG для последующей оценки.
+
+    Нужен как внутренняя «контрактная» структура: в пайплайне дальше ожидаются
+    только `answer` и список `contexts`, независимо от того, что вернул
+    исходный RAG-объект (dict/tuple/custom class).
+    """
+
     def __init__(self, answer: str, contexts: list[str]) -> None:
+        """Сохраняет нормализованный ответ и контексты."""
+
         self.answer = answer
         self.contexts = contexts
 
 
 class SentenceTransformerEmbeddingsAdapter:
-    """LangChain-compatible embeddings over a preloaded SentenceTransformer."""
+    """Адаптер `SentenceTransformer` к интерфейсу эмбеддингов LangChain.
+
+    Зачем:
+    - `ragas` и обертки LangChain ожидают методы `embed_documents/embed_query`;
+    - в проекте эмбеддер уже загружен как `SentenceTransformer`.
+
+    Почему отдельный класс:
+    - минимальный glue-code без привязки к конкретному месту пайплайна;
+    - позволяет переиспользовать один и тот же embedder в RAG и диагностике.
+    """
 
     def __init__(self, embedder: SentenceTransformer, device: str) -> None:
+        """Инициализирует адаптер уже загруженным embedder-ом и устройством."""
+
         self._embedder = embedder
         self._device = device
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Кодирует список текстов в нормализованные эмбеддинги."""
+
         if not texts:
             return []
         vectors = self._embedder.encode(
@@ -73,19 +109,36 @@ class SentenceTransformerEmbeddingsAdapter:
         return vectors.tolist()
 
     def embed_query(self, text: str) -> list[float]:
+        """Кодирует один запрос в вектор, совместимый с LangChain."""
+
         vectors = self.embed_documents([text])
         return vectors[0] if vectors else []
 
 
 def _default_bge_model_path() -> str:
+    """Возвращает путь к модели эмбеддингов для диагностики по умолчанию."""
+
     return os.environ.get("RAG_EVAL_BGE_M3_MODEL_PATH", "/home/vladislav/models/bge-m3")
 
 
 def _default_bge_device() -> str:
+    """Возвращает устройство (`cpu/cuda`) для диагностики по умолчанию."""
+
     return os.environ.get("RAG_EVAL_BGE_M3_DEVICE", os.environ.get("EMBEDDING_DEVICE", "cpu")).strip().lower()
 
 
 def adapt_response(raw) -> RagResponse:
+    """Приводит разные форматы ответа RAG к `RagResponse`.
+
+    Поддерживает:
+    - `RagResponse`;
+    - `dict` с ключами `answer/contexts`;
+    - `tuple/list` вида `(answer, contexts)`;
+    - объект с атрибутами `answer` и `contexts`.
+
+    Это позволяет не заставлять все RAG-системы строго реализовывать один тип.
+    """
+
     if isinstance(raw, RagResponse):
         return raw
     if isinstance(raw, dict):
@@ -102,6 +155,8 @@ def adapt_response(raw) -> RagResponse:
 
 
 def _extract_shared_chat_model(rag_system):
+    """Извлекает LLM из RAG-системы по публичному или внутреннему API."""
+
     getter = getattr(rag_system, "get_chat_model", None)
     if callable(getter):
         return getter()
@@ -109,6 +164,8 @@ def _extract_shared_chat_model(rag_system):
 
 
 def _extract_shared_sentence_embedder(rag_system):
+    """Извлекает embedder из RAG-системы для переиспользования в оценке."""
+
     getter = getattr(rag_system, "get_sentence_embedder", None)
     if callable(getter):
         return getter()
@@ -120,6 +177,8 @@ def _extract_shared_sentence_embedder(rag_system):
 
 
 def _extract_shared_embedding_device(rag_system) -> str | None:
+    """Пытается определить устройство embedder-а (`cpu/cuda`) из RAG-системы."""
+
     getter = getattr(rag_system, "get_embedding_device", None)
     if callable(getter):
         value = getter()
@@ -136,6 +195,8 @@ def _extract_shared_embedding_device(rag_system) -> str | None:
 
 
 def _extract_shared_embedding_model_path(rag_system) -> str | None:
+    """Пытается получить путь модели эмбеддингов из RAG-системы."""
+
     getter = getattr(rag_system, "get_embedding_model_path", None)
     if callable(getter):
         value = getter()
@@ -145,6 +206,16 @@ def _extract_shared_embedding_model_path(rag_system) -> str | None:
 
 
 def _resolve_judge_llm(judge_llm, rag_system):
+    """Разрешает объект judge-LLM для `ragas`.
+
+    Приоритет:
+    1) явно переданный `judge_llm`;
+    2) shared LLM из `rag_system`.
+
+    Если доступна обертка `LangchainLLMWrapper`, применяется она, чтобы
+    обеспечить корректную интеграцию с `ragas`.
+    """
+
     if judge_llm is not None:
         return judge_llm
 
@@ -157,6 +228,12 @@ def _resolve_judge_llm(judge_llm, rag_system):
 
 
 def _resolve_judge_embeddings(judge_embeddings, rag_system):
+    """Разрешает judge-эмбеддинги для метрик `ragas`.
+
+    Если эмбеддинги не переданы явно, используется shared embedder из RAG-системы.
+    Это уменьшает расход ресурсов и исключает повторную загрузку модели.
+    """
+
     if judge_embeddings is not None:
         return judge_embeddings
     if LangchainEmbeddingsWrapper is None:
@@ -170,12 +247,23 @@ def _resolve_judge_embeddings(judge_embeddings, rag_system):
 
 
 def build_shared_judges_from_rag_system(rag_system) -> tuple[t.Any, t.Any]:
+    """Строит пару `(judge_llm, judge_embeddings)` только из `rag_system`."""
+
     judge_llm = _resolve_judge_llm(None, rag_system)
     judge_embeddings = _resolve_judge_embeddings(None, rag_system)
     return judge_llm, judge_embeddings
 
 
 def _normalize_gold(df: pd.DataFrame) -> pd.DataFrame:
+    """Нормализует DataFrame золотых вопросов к единому формату.
+
+    Что делает:
+    - нормализует имена колонок;
+    - приводит синонимы к `question` и `ground_truth`;
+    - удаляет пустые вопросы;
+    - чистит пробелы в строках.
+    """
+
     df = df.copy()
     df.columns = [str(c).strip().lower().replace(" ", "_").replace("-", "_") for c in df.columns]
 
@@ -200,6 +288,8 @@ def _normalize_gold(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_xlsx(path: str | Path) -> pd.DataFrame:
+    """Загружает XLSX с gold-набором и применяет нормализацию."""
+
     gold_path = Path(path)
     if not gold_path.exists():
         raise FileNotFoundError(f"Не найден файл: {gold_path}")
@@ -207,6 +297,8 @@ def load_xlsx(path: str | Path) -> pd.DataFrame:
 
 
 def latest_xlsx(data_dir: str | Path) -> Path:
+    """Возвращает самый свежий XLSX-файл из каталога по времени изменения."""
+
     root = Path(data_dir)
     xlsx_files = sorted(root.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not xlsx_files:
@@ -215,12 +307,24 @@ def latest_xlsx(data_dir: str | Path) -> Path:
 
 
 def _word_count(text: str) -> int:
+    """Считает слова в тексте по регулярному токенайзеру `_TOKEN_RE`."""
+
     return len(_TOKEN_RE.findall(text or ""))
 
 
 def run_rag_over_questions(gold_df: pd.DataFrame, rag_system) -> pd.DataFrame:
+    """Запускает RAG по каждому вопросу и собирает таблицу для оценки.
+
+    На выходе содержит не только `answer/contexts`, но и runtime/retrieval
+    признаки, которые дальше используются в отчетах и диагностике.
+    """
+
     rows: list[dict] = []
-    for question in gold_df["question"].tolist():
+    questions = gold_df["question"].tolist()
+    total_questions = len(questions)
+    log_runtime_event("pipeline", "rag_stage_started", questions=total_questions)
+    for idx, question in enumerate(questions, start=1):
+        log_runtime_event("pipeline", "rag_question_started", index=idx, total=total_questions)
         started = time.perf_counter()
         response = adapt_response(rag_system.answer(question))
         elapsed = time.perf_counter() - started
@@ -239,16 +343,33 @@ def run_rag_over_questions(gold_df: pd.DataFrame, rag_system) -> pd.DataFrame:
                 "answer_word_count": int(_word_count(answer)),
             }
         )
+        log_runtime_event(
+            "pipeline",
+            "rag_question_finished",
+            index=idx,
+            total=total_questions,
+            elapsed_sec=round(elapsed, 3),
+            contexts_count=len(contexts),
+        )
 
     eval_df = pd.DataFrame(rows)
     if "ground_truth" in gold_df.columns:
         eval_df["ground_truth"] = gold_df["ground_truth"].tolist()
         eval_df["ground_truth_char_len"] = eval_df["ground_truth"].astype(str).map(len)
         eval_df["ground_truth_word_count"] = eval_df["ground_truth"].astype(str).map(_word_count)
+    log_runtime_event("pipeline", "rag_stage_finished", questions=total_questions)
     return eval_df
 
 
 def choose_metrics(eval_df: pd.DataFrame, judge_embeddings=None):
+    """Выбирает набор метрик `ragas` в зависимости от доступных полей/эмбеддингов.
+
+    Логика:
+    - `faithfulness` всегда;
+    - `answer_relevancy` только если есть embeddings;
+    - `context_precision/context_recall` только при наличии `ground_truth`.
+    """
+
     # answer_relevancy requires embeddings. If embeddings are not passed explicitly,
     # ragas may create a default provider (typically external API).
     metrics = [faithfulness]
@@ -265,21 +386,41 @@ def evaluate_with_ragas(
     judge_embeddings=None,
     ragas_run_config=None,
 ) -> tuple[pd.DataFrame, float]:
+    """Вычисляет метрики `ragas` и возвращает таблицу скоров + длительность.
+
+    Вызов обернут в `request_source("ragas")`, чтобы все запросы judge-LLM
+    в логах/троттлинге помечались отдельным источником.
+    """
+
     dataset = Dataset.from_pandas(eval_df, preserve_index=False)
-    started = time.perf_counter()
-    result = evaluate(
-        dataset,
-        metrics=choose_metrics(eval_df, judge_embeddings=judge_embeddings),
-        llm=judge_llm,
-        embeddings=judge_embeddings,
-        run_config=ragas_run_config,
+    log_runtime_event(
+        "pipeline",
+        "ragas_stage_started",
+        rows=len(eval_df),
+        max_workers=getattr(ragas_run_config, "max_workers", None),
     )
+    started = time.perf_counter()
+    with request_source("ragas"):
+        result = evaluate(
+            dataset,
+            metrics=choose_metrics(eval_df, judge_embeddings=judge_embeddings),
+            llm=judge_llm,
+            embeddings=judge_embeddings,
+            run_config=ragas_run_config,
+        )
     elapsed = time.perf_counter() - started
     scores_df = result.to_pandas()
+    log_runtime_event("pipeline", "ragas_stage_finished", rows=len(scores_df), elapsed_sec=round(elapsed, 3))
     return scores_df, elapsed
 
 
 def summarize(scores_df: pd.DataFrame) -> pd.DataFrame:
+    """Строит агрегированную статистику по всем числовым метрикам.
+
+    Используется для сводных CSV/HTML блоков: среднее, std, минимум, максимум,
+    число пропусков.
+    """
+
     numeric = scores_df.select_dtypes(include="number")
     if numeric.empty:
         return pd.DataFrame()
@@ -299,10 +440,14 @@ def summarize(scores_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _token_set(text: str) -> set[str]:
+    """Преобразует текст в множество токенов нижнего регистра."""
+
     return {token.lower() for token in _TOKEN_RE.findall(text or "")}
 
 
 def _token_jaccard(a: str, b: str) -> float:
+    """Считает лексическое сходство Жаккара между двумя строками."""
+
     left = _token_set(a)
     right = _token_set(b)
     if not left and not right:
@@ -313,12 +458,16 @@ def _token_jaccard(a: str, b: str) -> float:
 
 
 def _cosine(vec_a: np.ndarray | None, vec_b: np.ndarray | None) -> float | None:
+    """Считает cosine similarity для уже нормализованных векторов."""
+
     if vec_a is None or vec_b is None:
         return None
     return float(np.dot(vec_a, vec_b))
 
 
 def _shorten_text(value: str, limit: int = TEXT_PREVIEW_LIMIT) -> str:
+    """Обрезает длинный текст для компактного отображения в отчетах."""
+
     text = (value or "").strip()
     if len(text) <= limit:
         return text
@@ -326,18 +475,24 @@ def _shorten_text(value: str, limit: int = TEXT_PREVIEW_LIMIT) -> str:
 
 
 def _to_float_or_none(value: float | None) -> float | None:
+    """Безопасно приводит значение к `float`, сохраняя `None`."""
+
     if value is None:
         return None
     return float(value)
 
 
 def _best(values: list[float]) -> float | None:
+    """Возвращает максимум списка или `None`, если список пуст."""
+
     if not values:
         return None
     return float(max(values))
 
 
 def _mean(values: list[float]) -> float | None:
+    """Возвращает среднее списка или `None`, если список пуст."""
+
     if not values:
         return None
     return float(np.mean(values))
@@ -350,6 +505,18 @@ def compute_bge_m3_diagnostics(
     device: str | None = None,
     embedder: SentenceTransformer | None = None,
 ) -> tuple[pd.DataFrame, dict[str, t.Any]]:
+    """Считает дополнительные диагностические метрики на эмбеддингах.
+
+    Что оценивается:
+    - cosine-сходство между вопросом/ответом/эталоном;
+    - качество контекстов (лучшие/средние сходства);
+    - простые лексические индикаторы (Jaccard).
+
+    Почему отдельный блок:
+    - дает независимую от judge-LLM сигнализацию;
+    - помогает локализовать проблемы retrieval vs generation.
+    """
+
     resolved_model_path = model_path or _default_bge_model_path()
     resolved_device = (device or _default_bge_device() or "cpu").strip().lower()
     diag_meta: dict[str, t.Any] = {
@@ -374,6 +541,8 @@ def compute_bge_m3_diagnostics(
     text_to_idx: dict[str, int] = {}
 
     def register(text: str) -> str:
+        """Регистрирует уникальный текст и возвращает его канонический вид."""
+
         cleaned = (text or "").strip()
         if cleaned not in text_to_idx:
             text_to_idx[cleaned] = len(unique_texts)
@@ -406,6 +575,8 @@ def compute_bge_m3_diagnostics(
     diag_meta["unique_texts_embedded"] = int(len(unique_texts))
 
     def vector(text: str) -> np.ndarray | None:
+        """Возвращает эмбеддинг текста из локального кэша или `None`."""
+
         if not text:
             return None
         return embeddings[text_to_idx[text]]
@@ -475,10 +646,14 @@ def compute_bge_m3_diagnostics(
 
 
 def _extract_langchain_llm(raw_llm):
+    """Извлекает внутренний LangChain-объект из оберток (если они есть)."""
+
     return getattr(raw_llm, "langchain_llm", None) or getattr(raw_llm, "llm", None) or raw_llm
 
 
 def _extract_llm_config(prefix: str, llm_obj) -> dict[str, t.Any]:
+    """Сериализует важные параметры LLM в плоский конфиг-словарь."""
+
     config: dict[str, t.Any] = {}
     if llm_obj is None:
         return config
@@ -497,6 +672,8 @@ def _extract_llm_config(prefix: str, llm_obj) -> dict[str, t.Any]:
 
 
 def _extract_rag_system_config(rag_system) -> dict[str, t.Any]:
+    """Собирает технический конфиг RAG-системы для воспроизводимости запуска."""
+
     config: dict[str, t.Any] = {
         "rag_system_class": type(rag_system).__name__,
         "rag_system_module": type(rag_system).__module__,
@@ -533,6 +710,8 @@ def _extract_rag_system_config(rag_system) -> dict[str, t.Any]:
 
 
 def _json_safe(value: t.Any) -> t.Any:
+    """Преобразует значение к JSON-совместимому виду для `run_meta.json`."""
+
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, (list, tuple)):
@@ -543,6 +722,8 @@ def _json_safe(value: t.Any) -> t.Any:
 
 
 def _format_value(value: t.Any) -> str:
+    """Форматирует значения для человеко-читаемого `config.csv`."""
+
     if isinstance(value, float):
         return f"{value:.6f}"
     if isinstance(value, (list, tuple, dict)):
@@ -553,6 +734,8 @@ def _format_value(value: t.Any) -> str:
 
 
 def _config_description_map() -> dict[str, str]:
+    """Возвращает словарь описаний параметров, выводимых в `config.csv`."""
+
     return {
         "run_name": "Имя запуска/системы в отчете.",
         "gold_path": "Путь к XLSX с золотыми вопросами.",
@@ -579,10 +762,13 @@ def _config_description_map() -> dict[str, str]:
         "rag_total_generation_sec": "Суммарное время генерации ответов RAG (сек).",
         "rag_avg_generation_sec": "Среднее время генерации одного ответа RAG (сек).",
         "ragas_total_eval_sec": "Суммарное время вычисления метрик RAGAS (сек).",
+        "gigachat_min_interval_sec": "Минимальный интервал между запросами к GigaChat (сек).",
     }
 
 
 def _build_config_df(config_dict: dict[str, t.Any]) -> pd.DataFrame:
+    """Собирает табличный вид runtime-конфига с пояснениями параметров."""
+
     descriptions = _config_description_map()
     rows = []
     for key in sorted(config_dict):
@@ -597,6 +783,8 @@ def _build_config_df(config_dict: dict[str, t.Any]) -> pd.DataFrame:
 
 
 def _build_parameter_guide_df() -> pd.DataFrame:
+    """Формирует справочник интерпретации метрик/параметров отчета."""
+
     rows = [
         {
             "metric_or_param": "faithfulness",
@@ -653,6 +841,8 @@ def _build_parameter_guide_df() -> pd.DataFrame:
 
 
 def _metric_description_map() -> dict[str, str]:
+    """Строит словарь `метрика -> описание` для HTML-легенд."""
+
     guide_df = _build_parameter_guide_df()
     mapping = {
         str(row["metric_or_param"]): str(row["how_to_read"])
@@ -672,6 +862,8 @@ def _metric_description_map() -> dict[str, str]:
 
 
 def _display_metric_name(name: str) -> str:
+    """Нормализует имя метрики для отображения в отчете."""
+
     value = str(name)
     if "bge_m3" in value:
         value = value.replace("bge_m3", "vectorizer")
@@ -685,6 +877,8 @@ def _display_metric_name(name: str) -> str:
 
 
 def _format_numeric_for_html(df: pd.DataFrame) -> pd.DataFrame:
+    """Форматирует числовые колонки DataFrame в строки для HTML-таблиц."""
+
     view = df.copy()
     for col in view.columns:
         if pd.api.types.is_numeric_dtype(view[col]):
@@ -693,6 +887,8 @@ def _format_numeric_for_html(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _to_html_table(df: pd.DataFrame, *, max_rows: int | None = None) -> str:
+    """Преобразует DataFrame в HTML-таблицу с форматированием и алиасами метрик."""
+
     if df.empty:
         return "<p>Нет данных</p>"
     view = _format_numeric_for_html(df)
@@ -706,6 +902,8 @@ def _to_html_table(df: pd.DataFrame, *, max_rows: int | None = None) -> str:
 
 
 def _metric_legend_html(df: pd.DataFrame) -> str:
+    """Генерирует HTML-блок с объяснениями метрик, встречающихся в таблице."""
+
     if df.empty:
         return ""
 
@@ -744,6 +942,12 @@ def _metric_legend_html(df: pd.DataFrame) -> str:
 
 
 def _compute_health_score(scores_df: pd.DataFrame) -> dict[str, t.Any]:
+    """Считает интегральный health score (0..100) из ключевых quality-метрик.
+
+    Это быстрый индикатор статуса системы для дашборда, а не замена
+    детального анализа по каждой метрике.
+    """
+
     # Aggregate quality-only metrics into one number (0..100) for quick status checks.
     metric_weights: list[tuple[str, float]] = [
         ("faithfulness", 1.0),
@@ -788,6 +992,8 @@ def _compute_health_score(scores_df: pd.DataFrame) -> dict[str, t.Any]:
 
 
 def _ragas_alerts_html(scores_df: pd.DataFrame) -> str:
+    """Формирует предупреждения по типовым аномалиям в метриках `ragas`."""
+
     alerts: list[str] = []
 
     if "faithfulness" in scores_df.columns:
@@ -827,6 +1033,8 @@ def _ragas_alerts_html(scores_df: pd.DataFrame) -> str:
 
 
 def _health_details_html(payload: dict[str, t.Any]) -> str:
+    """Строит HTML-расшифровку того, из каких метрик собран health score."""
+
     used = payload.get("used") or []
     if not used:
         return '<p class="section-note">Нет доступных quality-метрик для вычисления интегрального показателя.</p>'
@@ -847,6 +1055,8 @@ def _health_details_html(payload: dict[str, t.Any]) -> str:
 
 
 def _build_display_table(scores_df: pd.DataFrame) -> pd.DataFrame:
+    """Собирает компактную витрину по вопросам для отчета и `scores_compact.csv`."""
+
     df = scores_df.copy()
 
     if "question" in df.columns:
@@ -895,6 +1105,15 @@ def build_html_report(
     scores_df: pd.DataFrame,
     artifacts: list[str],
 ) -> Path:
+    """Генерирует итоговый HTML-отчет и сохраняет его в run-директорию.
+
+    Включает:
+    - health score;
+    - сводки по ragas/runtime/диагностике;
+    - проблемные и медленные примеры;
+    - конфиг запуска и список артефактов.
+    """
+
     created_at = datetime.now(timezone.utc).isoformat()
     health = _compute_health_score(scores_df)
     ragas_alerts_html = _ragas_alerts_html(scores_df)
@@ -1107,11 +1326,29 @@ def run_single_rag_eval(
     run_name: str = "rag",
     use_shared_rag_system_models: bool = True,
 ) -> Path:
+    """Запускает полный eval-проход одной RAG-системы end-to-end.
+
+    Последовательность:
+    1) загрузка gold-набора;
+    2) генерация ответов RAG;
+    3) оценка `ragas`;
+    4) дополнительная диагностика эмбеддингами;
+    5) сохранение CSV/JSON/HTML артефактов.
+
+    Важный момент:
+    - при backend `GigaChat` применяются межэтапные паузы throttling
+      через `ensure_gigachat_gap`, чтобы соблюдать ограничение по частоте.
+    """
+
     run_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = Path(reports_dir) / f"{run_stamp}_{run_name}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    log_runtime_event("pipeline", "run_started", run_name=run_name, run_dir=str(run_dir))
 
     gold_df = load_xlsx(gold_path)
+    rag_llm = _extract_shared_chat_model(rag_system)
+    should_enforce_gigachat_interval = is_gigachat_model(rag_llm)
+
     eval_df = run_rag_over_questions(gold_df, rag_system)
     if use_shared_rag_system_models:
         resolved_judge_llm = _resolve_judge_llm(None, rag_system)
@@ -1119,12 +1356,20 @@ def run_single_rag_eval(
     else:
         resolved_judge_llm = _resolve_judge_llm(judge_llm, rag_system)
         resolved_judge_embeddings = _resolve_judge_embeddings(judge_embeddings, rag_system)
+
+    judge_inner_llm = _extract_langchain_llm(resolved_judge_llm)
+    should_enforce_gigachat_interval = should_enforce_gigachat_interval or is_gigachat_model(judge_inner_llm)
+    if should_enforce_gigachat_interval:
+        ensure_gigachat_gap(component="pipeline", reason="between_rag_and_ragas")
+
     scores_df, ragas_elapsed = evaluate_with_ragas(
         eval_df,
         judge_llm=resolved_judge_llm,
         judge_embeddings=resolved_judge_embeddings,
         ragas_run_config=ragas_run_config,
     )
+    if should_enforce_gigachat_interval:
+        ensure_gigachat_gap(component="pipeline", reason="after_ragas_before_next_stage")
 
     alias_pairs = [
         ("question", "user_input"),
@@ -1140,6 +1385,7 @@ def run_single_rag_eval(
         if col not in scores_df.columns:
             scores_df[col] = eval_df[col]
 
+    log_runtime_event("pipeline", "vectorizer_diagnostics_started", rows=len(eval_df))
     shared_embedder = _extract_shared_sentence_embedder(rag_system)
     diag_df, diag_meta = compute_bge_m3_diagnostics(
         eval_df,
@@ -1149,6 +1395,12 @@ def run_single_rag_eval(
     )
     if not diag_df.empty:
         scores_df = scores_df.join(diag_df)
+    log_runtime_event(
+        "pipeline",
+        "vectorizer_diagnostics_finished",
+        rows=len(scores_df),
+        enabled=diag_meta.get("enabled", False),
+    )
 
     summary_df = summarize(scores_df)
     ragas_cols = [col for col in ["answer_relevancy", "faithfulness", "context_precision", "context_recall"] if col in scores_df.columns]
@@ -1170,7 +1422,7 @@ def run_single_rag_eval(
     summary_bge_df = summarize(scores_df[bge_cols]) if bge_cols else pd.DataFrame()
     summary_runtime_df = summarize(scores_df[runtime_cols]) if runtime_cols else pd.DataFrame()
 
-    compact_df = _build_display_table(scores_df)
+    compact_df = report_build_display_table(scores_df)
 
     scores_df.to_csv(run_dir / "scores.csv", index=False)
     compact_df.to_csv(run_dir / "scores_compact.csv", index=False)
@@ -1180,7 +1432,6 @@ def run_single_rag_eval(
     summary_bge_df.to_csv(run_dir / "summary_bge_m3.csv", index=False)
     summary_runtime_df.to_csv(run_dir / "summary_runtime.csv", index=False)
 
-    judge_inner_llm = _extract_langchain_llm(resolved_judge_llm)
     config = {
         "run_name": run_name,
         "gold_path": str(Path(gold_path).resolve()),
@@ -1198,6 +1449,7 @@ def run_single_rag_eval(
         "bge_m3_unique_texts_embedded": diag_meta.get("unique_texts_embedded"),
         "bge_m3_error": diag_meta.get("error"),
         "bge_m3_reused_embedder": diag_meta.get("reused_embedder"),
+        "gigachat_min_interval_sec": gigachat_min_interval_seconds() if should_enforce_gigachat_interval else None,
     }
     config.update(_extract_llm_config("judge_llm", judge_inner_llm))
     config.update(_extract_rag_system_config(rag_system))
@@ -1221,7 +1473,7 @@ def run_single_rag_eval(
         "report.html",
     ]
 
-    html_path = build_html_report(
+    html_path = report_build_html_report(
         run_dir=run_dir,
         run_name=run_name,
         config_df=config_df,
@@ -1259,6 +1511,10 @@ def run_single_rag_eval(
         "html_report": html_path.name,
     }
     (run_dir / "run_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if should_enforce_gigachat_interval:
+        ensure_gigachat_gap(component="pipeline", reason="run_cycle_tail_gap")
+    log_runtime_event("pipeline", "run_finished", run_name=run_name, run_dir=str(run_dir))
 
     return run_dir
 

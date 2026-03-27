@@ -1,21 +1,38 @@
-"""Single RAG system: GigaChat API + BGE-M3 retriever over local FAISS."""
+"""RAG-система на GigaChat/KoboldCpp + ретривер BGE-M3 + локальный FAISS.
+
+Файл реализует саму проверяемую систему:
+- загрузка конфигурации из env;
+- поиск контекстов в FAISS;
+- генерация ответа LLM по шаблону;
+- вспомогательные методы для совместного использования LLM/embedder в `ragas`.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 import json
 import os
+import time
 
 import faiss  # type: ignore
 from sentence_transformers import SentenceTransformer
 
-from llm_interface import build_langchain_chat_model, normalize_backend_name
+from llm_core.llm_interface import build_langchain_chat_model, normalize_backend_name
+from llm_core.runtime_control import log_runtime_event, request_source
 
 
 RAG_SYSTEM_NAME = "gigachat_bge_m3"
 
 
 class RagSystemConfig:
+    """Конфигурация RAG-системы из окружения.
+
+    Отдельный класс нужен для:
+    - явной типизации ключевых параметров;
+    - удобной сериализации в отчеты;
+    - проверки/нормализации входных значений в одном месте.
+    """
+
     def __init__(
         self,
         *,
@@ -25,9 +42,8 @@ class RagSystemConfig:
         retriever_top_k: int,
         model_timeout_seconds: float,
         llm_backend: str,
-        gigachat_model: str | None,
-        gigachat_credentials: str | None,
-        gigachat_scope: str | None,
+        gigachat_model_name: str | None,
+        gigachat_api_token: str | None,
         gigachat_base_url: str | None,
         koboldcpp_base_url: str,
         koboldcpp_api_key: str,
@@ -37,6 +53,8 @@ class RagSystemConfig:
         koboldcpp_max_retries: int,
         prompt_template: str,
     ) -> None:
+        """Инициализирует и нормализует параметры конфигурации системы."""
+
         self.vector_db_dir = Path(vector_db_dir).expanduser()
         self.embedding_model_path = embedding_model_path
         self.embedding_device = embedding_device.strip().lower()
@@ -44,9 +62,8 @@ class RagSystemConfig:
         self.model_timeout_seconds = float(model_timeout_seconds)
         self.llm_backend = normalize_backend_name(llm_backend)
 
-        self.gigachat_model = gigachat_model
-        self.gigachat_credentials = gigachat_credentials
-        self.gigachat_scope = gigachat_scope
+        self.gigachat_model_name = gigachat_model_name
+        self.gigachat_api_token = gigachat_api_token
         self.gigachat_base_url = gigachat_base_url
 
         self.koboldcpp_base_url = koboldcpp_base_url
@@ -60,17 +77,25 @@ class RagSystemConfig:
 
     @property
     def index_path(self) -> Path:
+        """Путь к FAISS-индексу."""
+
         return self.vector_db_dir / "index.faiss"
 
     @property
     def docs_json_path(self) -> Path:
+        """Путь к JSON с корпусом чанков."""
+
         return self.vector_db_dir / "docs.json"
 
     @property
     def docs_jsonl_path(self) -> Path:
+        """Путь к JSONL с корпусом чанков."""
+
         return self.vector_db_dir / "docs.jsonl"
 
     def to_dict(self) -> dict[str, str | int | float | None]:
+        """Сериализует конфиг в словарь для логов/отчетов."""
+
         return {
             "vector_db_dir": str(self.vector_db_dir),
             "embedding_model_path": self.embedding_model_path,
@@ -78,7 +103,7 @@ class RagSystemConfig:
             "retriever_top_k": self.retriever_top_k,
             "model_timeout_seconds": self.model_timeout_seconds,
             "llm_backend": self.llm_backend,
-            "gigachat_model": self.gigachat_model,
+            "gigachat_model_name": self.gigachat_model_name,
             "gigachat_base_url": self.gigachat_base_url,
             "koboldcpp_base_url": self.koboldcpp_base_url,
             "koboldcpp_model": self.koboldcpp_model,
@@ -89,12 +114,18 @@ class RagSystemConfig:
 
 
 class RagAnswer:
+    """Минимальный формат ответа RAG: текст + список использованных контекстов."""
+
     def __init__(self, answer: str, contexts: list[str]) -> None:
+        """Сохраняет сгенерированный ответ и список контекстов."""
+
         self.answer = answer
         self.contexts = contexts
 
 
 def default_prompt_template() -> str:
+    """Возвращает шаблон промпта по умолчанию для генерации ответа."""
+
     return """Ты помощник, отвечающий только по предоставленным контекстам.
 Если в контекстах нет ответа, честно скажи, что данных недостаточно.
 
@@ -109,6 +140,12 @@ def default_prompt_template() -> str:
 
 
 def load_config_from_env(env: dict[str, str] | None = None) -> RagSystemConfig:
+    """Собирает `RagSystemConfig` из переменных окружения.
+
+    Поддерживает новые имена (`GIGACHAT_API_TOKEN`, `GIGACHAT_MODEL_NAME`)
+    и обратную совместимость со старыми переменными.
+    """
+
     source = env or os.environ
     project_root = Path(__file__).resolve().parents[1]
 
@@ -119,9 +156,8 @@ def load_config_from_env(env: dict[str, str] | None = None) -> RagSystemConfig:
         retriever_top_k=int(source.get("RETRIEVER_TOP_K", "5")),
         model_timeout_seconds=float(source.get("MODEL_TIMEOUT_SECONDS", "5")),
         llm_backend=source.get("RAG_LLM_BACKEND", "gigachat"),
-        gigachat_model=source.get("GIGACHAT_MODEL"),
-        gigachat_credentials=source.get("GIGACHAT_CREDENTIALS"),
-        gigachat_scope=source.get("GIGACHAT_SCOPE"),
+        gigachat_model_name=source.get("GIGACHAT_MODEL_NAME", source.get("GIGACHAT_MODEL")),
+        gigachat_api_token=source.get("GIGACHAT_API_TOKEN", source.get("GIGACHAT_CREDENTIALS")),
         gigachat_base_url=source.get("GIGACHAT_BASE_URL"),
         koboldcpp_base_url=source.get("KOBOLDCPP_BASE_URL", "http://127.0.0.1:5001/v1"),
         koboldcpp_api_key=source.get("KOBOLDCPP_API_KEY", "koboldcpp"),
@@ -134,6 +170,8 @@ def load_config_from_env(env: dict[str, str] | None = None) -> RagSystemConfig:
 
 
 def _load_texts(config: RagSystemConfig) -> list[str]:
+    """Загружает тексты чанков из `docs.json` или `docs.jsonl`."""
+
     if config.docs_json_path.exists():
         data = json.loads(config.docs_json_path.read_text(encoding="utf-8"))
         return [str(item.get("text", "")).strip() for item in data if str(item.get("text", "")).strip()]
@@ -153,6 +191,8 @@ def _load_texts(config: RagSystemConfig) -> list[str]:
 
 
 def build_sentence_embedder(model_path: str, device: str) -> tuple[SentenceTransformer, str]:
+    """Создает `SentenceTransformer` для ретривера с fallback на CPU."""
+
     normalized_device = (device or "cpu").strip().lower()
     if normalized_device not in {"cpu", "cuda"}:
         raise ValueError("EMBEDDING_DEVICE должен быть 'cpu' или 'cuda'")
@@ -165,6 +205,8 @@ def build_sentence_embedder(model_path: str, device: str) -> tuple[SentenceTrans
 
 
 class BgeM3FaissRetriever:
+    """Ретривер поверх FAISS-индекса и эмбеддингов BGE-M3."""
+
     def __init__(
         self,
         *,
@@ -174,6 +216,8 @@ class BgeM3FaissRetriever:
         embedding_device: str,
         top_k: int,
     ) -> None:
+        """Инициализирует ретривер индексом, корпусом и embedder-ом."""
+
         self._index = index
         self._texts = texts
         self._embedder = embedder
@@ -188,6 +232,8 @@ class BgeM3FaissRetriever:
         embedder: SentenceTransformer | None = None,
         embedding_device: str | None = None,
     ) -> "BgeM3FaissRetriever":
+        """Фабричный метод сборки ретривера из `RagSystemConfig`."""
+
         if not config.index_path.exists():
             raise FileNotFoundError(f"Не найден индекс FAISS: {config.index_path}")
 
@@ -217,6 +263,10 @@ class BgeM3FaissRetriever:
         )
 
     def retrieve(self, query: str, top_k: int | None = None) -> list[str]:
+        """Ищет наиболее близкие контексты к запросу и возвращает их тексты."""
+
+        started = time.perf_counter()
+        log_runtime_event("retriever", "started", system=RAG_SYSTEM_NAME, top_k=top_k or self._top_k)
         target_top_k = int(top_k or self._top_k)
         vectors = self._embedder.encode(
             [query],
@@ -226,26 +276,45 @@ class BgeM3FaissRetriever:
         ).astype("float32")
         _, indexes = self._index.search(vectors, target_top_k)
         found = indexes[0].tolist() if len(indexes) else []
-        return [self._texts[i] for i in found if 0 <= i < len(self._texts)]
+        contexts = [self._texts[i] for i in found if 0 <= i < len(self._texts)]
+        elapsed = time.perf_counter() - started
+        log_runtime_event(
+            "retriever",
+            "finished",
+            system=RAG_SYSTEM_NAME,
+            contexts_count=len(contexts),
+            elapsed_sec=round(elapsed, 3),
+        )
+        return contexts
 
     @property
     def embedder(self) -> SentenceTransformer:
+        """Возвращает объект embedder-а, используемого ретривером."""
+
         return self._embedder
 
     @property
     def embedding_device(self) -> str:
+        """Возвращает устройство embedder-а (`cpu/cuda`)."""
+
         return self._embedding_device
 
     @property
     def texts(self) -> list[str]:
+        """Возвращает загруженный текстовый корпус."""
+
         return self._texts
 
     @property
     def top_k(self) -> int:
+        """Возвращает число контекстов по умолчанию для retrieval."""
+
         return self._top_k
 
 
 class BgeM3RagSystem:
+    """Полная RAG-система: retrieval + prompt + LLM generation."""
+
     def __init__(
         self,
         *,
@@ -255,6 +324,8 @@ class BgeM3RagSystem:
         prompt_template: str,
         embedding_model_path: str,
     ) -> None:
+        """Инициализирует RAG-систему зависимостями и runtime-параметрами."""
+
         self._retriever = retriever
         self._llm = llm
         self._llm_backend = llm_backend
@@ -262,30 +333,51 @@ class BgeM3RagSystem:
         self._embedding_model_path = embedding_model_path
 
     def answer(self, question: str) -> RagAnswer:
+        """Строит ответ на вопрос на основе найденных контекстов."""
+
+        log_runtime_event("rag", "question_started", system=RAG_SYSTEM_NAME, question_chars=len(question or ""))
         contexts = self._retriever.retrieve(question)
         context_text = "\n\n".join(f"{i + 1}. {ctx}" for i, ctx in enumerate(contexts)) or "Контексты не найдены."
         prompt = self._prompt_template.format(contexts=context_text, question=question)
 
-        raw = self._llm.invoke(prompt)
+        with request_source("rag"):
+            raw = self._llm.invoke(prompt)
         text = getattr(raw, "content", raw)
         if isinstance(text, list):
             text = " ".join(str(part) for part in text)
 
+        log_runtime_event(
+            "rag",
+            "question_finished",
+            system=RAG_SYSTEM_NAME,
+            contexts_count=len(contexts),
+            answer_chars=len(str(text or "")),
+        )
         return RagAnswer(answer=str(text).strip(), contexts=contexts)
 
     def get_chat_model(self):
+        """Возвращает внутренний LLM для shared-режима с `ragas`."""
+
         return self._llm
 
     def get_sentence_embedder(self) -> SentenceTransformer:
+        """Возвращает embedder ретривера для повторного использования."""
+
         return self._retriever.embedder
 
     def get_embedding_device(self) -> str:
+        """Возвращает устройство, на котором работает embedder."""
+
         return self._retriever.embedding_device
 
     def get_embedding_model_path(self) -> str:
+        """Возвращает путь модели эмбеддингов."""
+
         return self._embedding_model_path
 
     def get_system_config(self) -> dict[str, str | int | float | None]:
+        """Возвращает диагностический срез параметров системы для отчета."""
+
         return {
             "llm_backend": self._llm_backend,
             "embedding_model_path": self._embedding_model_path,
@@ -302,6 +394,12 @@ def build_rag_system(
     shared_llm=None,
     shared_embedder: SentenceTransformer | None = None,
 ) -> BgeM3RagSystem:
+    """Собирает экземпляр `BgeM3RagSystem` из конфига и зависимостей.
+
+    Если `shared_llm/shared_embedder` переданы, переиспользует их, чтобы
+    избежать повторной загрузки моделей и ускорить пайплайн оценки.
+    """
+
     cfg = config or load_config_from_env()
 
     backend = llm_backend or cfg.llm_backend
@@ -315,9 +413,8 @@ def build_rag_system(
             backend=backend,
             timeout=cfg.model_timeout_seconds,
             gigachat_options={
-                "model": cfg.gigachat_model,
-                "credentials": cfg.gigachat_credentials,
-                "scope": cfg.gigachat_scope,
+                "model_name": cfg.gigachat_model_name,
+                "api_token": cfg.gigachat_api_token,
                 "base_url": cfg.gigachat_base_url,
             },
             koboldcpp_options={

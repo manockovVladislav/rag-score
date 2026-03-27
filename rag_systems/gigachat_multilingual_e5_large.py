@@ -1,21 +1,31 @@
-"""Single RAG system: GigaChat/KoboldCpp + multilingual-e5-large over local FAISS."""
+"""RAG-система на GigaChat/KoboldCpp + multilingual-e5-large + локальный FAISS.
+
+Отличие от BGE-варианта:
+- используется модель эмбеддингов e5-large;
+- запросы к embedder подаются в формате `query: ...`;
+- есть дополнительные проверки/ограничения для стабильной работы в изоляции.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 import json
 import os
+import time
 
 import faiss  # type: ignore
 from sentence_transformers import SentenceTransformer
 
-from llm_interface import build_langchain_chat_model, normalize_backend_name
+from llm_core.llm_interface import build_langchain_chat_model, normalize_backend_name
+from llm_core.runtime_control import log_runtime_event, request_source
 
 
 RAG_SYSTEM_NAME = "gigachat_multilingual_e5_large"
 
 
 class RagSystemConfig:
+    """Конфигурация RAG-системы e5 из переменных окружения."""
+
     def __init__(
         self,
         *,
@@ -25,9 +35,8 @@ class RagSystemConfig:
         retriever_top_k: int,
         model_timeout_seconds: float,
         llm_backend: str,
-        gigachat_model: str | None,
-        gigachat_credentials: str | None,
-        gigachat_scope: str | None,
+        gigachat_model_name: str | None,
+        gigachat_api_token: str | None,
         gigachat_base_url: str | None,
         koboldcpp_base_url: str,
         koboldcpp_api_key: str,
@@ -37,6 +46,8 @@ class RagSystemConfig:
         koboldcpp_max_retries: int,
         prompt_template: str,
     ) -> None:
+        """Инициализирует и нормализует параметры конфигурации e5-системы."""
+
         self.vector_db_dir = Path(vector_db_dir).expanduser()
         self.embedding_model_path = embedding_model_path
         self.embedding_device = embedding_device.strip().lower()
@@ -44,9 +55,8 @@ class RagSystemConfig:
         self.model_timeout_seconds = float(model_timeout_seconds)
         self.llm_backend = normalize_backend_name(llm_backend)
 
-        self.gigachat_model = gigachat_model
-        self.gigachat_credentials = gigachat_credentials
-        self.gigachat_scope = gigachat_scope
+        self.gigachat_model_name = gigachat_model_name
+        self.gigachat_api_token = gigachat_api_token
         self.gigachat_base_url = gigachat_base_url
 
         self.koboldcpp_base_url = koboldcpp_base_url
@@ -60,17 +70,25 @@ class RagSystemConfig:
 
     @property
     def index_path(self) -> Path:
+        """Путь к FAISS-индексу."""
+
         return self.vector_db_dir / "index.faiss"
 
     @property
     def docs_json_path(self) -> Path:
+        """Путь к JSON с корпусом чанков."""
+
         return self.vector_db_dir / "docs.json"
 
     @property
     def docs_jsonl_path(self) -> Path:
+        """Путь к JSONL с корпусом чанков."""
+
         return self.vector_db_dir / "docs.jsonl"
 
     def to_dict(self) -> dict[str, str | int | float | None]:
+        """Сериализует конфиг в словарь для диагностик и отчетов."""
+
         return {
             "vector_db_dir": str(self.vector_db_dir),
             "embedding_model_path": self.embedding_model_path,
@@ -78,7 +96,7 @@ class RagSystemConfig:
             "retriever_top_k": self.retriever_top_k,
             "model_timeout_seconds": self.model_timeout_seconds,
             "llm_backend": self.llm_backend,
-            "gigachat_model": self.gigachat_model,
+            "gigachat_model_name": self.gigachat_model_name,
             "gigachat_base_url": self.gigachat_base_url,
             "koboldcpp_base_url": self.koboldcpp_base_url,
             "koboldcpp_model": self.koboldcpp_model,
@@ -89,12 +107,18 @@ class RagSystemConfig:
 
 
 class RagAnswer:
+    """Минимальный формат ответа RAG: текст + список контекстов."""
+
     def __init__(self, answer: str, contexts: list[str]) -> None:
+        """Сохраняет ответ модели и использованные контексты."""
+
         self.answer = answer
         self.contexts = contexts
 
 
 def default_prompt_template() -> str:
+    """Возвращает шаблон промпта по умолчанию для генерации ответа."""
+
     return """Ты помощник, отвечающий только по предоставленным контекстам.
 Если в контекстах нет ответа, честно скажи, что данных недостаточно.
 
@@ -109,6 +133,11 @@ def default_prompt_template() -> str:
 
 
 def _enforce_single_thread() -> None:
+    """Ограничивает сторонние библиотеки одним потоком для предсказуемости.
+
+    Это уменьшает риск oversubscription CPU в изолированной среде.
+    """
+
     try:
         faiss.omp_set_num_threads(1)
     except Exception:
@@ -125,6 +154,8 @@ def _enforce_single_thread() -> None:
 
 
 def _is_cuda_really_usable() -> bool:
+    """Проверяет не только наличие CUDA, но и реальную работоспособность."""
+
     try:
         import torch
 
@@ -137,14 +168,16 @@ def _is_cuda_really_usable() -> bool:
 
 
 def load_config_from_env(env: dict[str, str] | None = None) -> RagSystemConfig:
+    """Собирает конфиг e5-системы из env с поддержкой алиасов переменных."""
+
     source = env or os.environ
     project_root = Path(__file__).resolve().parents[1]
 
     # Для изолированной среды можно переопределить:
     # E5_EMBEDDING_MODEL_PATH=/path/to/multilingual-e5-large
     # GIGACHAT_BASE_URL=https://your-url
-    # GIGACHAT_CREDENTIALS=your_api_key
-    # GIGACHAT_MODEL=your_model_name
+    # GIGACHAT_API_TOKEN=your_api_token
+    # GIGACHAT_MODEL_NAME=your_model_name
     return RagSystemConfig(
         vector_db_dir=source.get("E5_VECTOR_DB_DIR", source.get("VECTOR_DB_DIR", str(project_root / "vector_db_e5_large"))),
         embedding_model_path=source.get(
@@ -155,9 +188,8 @@ def load_config_from_env(env: dict[str, str] | None = None) -> RagSystemConfig:
         retriever_top_k=int(source.get("E5_RETRIEVER_TOP_K", source.get("RETRIEVER_TOP_K", "5"))),
         model_timeout_seconds=float(source.get("MODEL_TIMEOUT_SECONDS", "5")),
         llm_backend=source.get("RAG_LLM_BACKEND", source.get("LLM_BACKEND", "gigachat")),
-        gigachat_model=source.get("GIGACHAT_MODEL"),
-        gigachat_credentials=source.get("GIGACHAT_CREDENTIALS"),
-        gigachat_scope=source.get("GIGACHAT_SCOPE"),
+        gigachat_model_name=source.get("GIGACHAT_MODEL_NAME", source.get("GIGACHAT_MODEL")),
+        gigachat_api_token=source.get("GIGACHAT_API_TOKEN", source.get("GIGACHAT_CREDENTIALS")),
         gigachat_base_url=source.get("GIGACHAT_BASE_URL"),
         koboldcpp_base_url=source.get("KOBOLDCPP_BASE_URL", "http://127.0.0.1:5001/v1"),
         koboldcpp_api_key=source.get("KOBOLDCPP_API_KEY", "koboldcpp"),
@@ -170,6 +202,8 @@ def load_config_from_env(env: dict[str, str] | None = None) -> RagSystemConfig:
 
 
 def _load_texts(config: RagSystemConfig) -> list[str]:
+    """Загружает тексты чанков из JSON/JSONL рядом с FAISS-индексом."""
+
     if config.docs_json_path.exists():
         data = json.loads(config.docs_json_path.read_text(encoding="utf-8"))
         return [str(item.get("text", "")).strip() for item in data if str(item.get("text", "")).strip()]
@@ -189,6 +223,8 @@ def _load_texts(config: RagSystemConfig) -> list[str]:
 
 
 def build_sentence_embedder(model_path: str, device: str) -> tuple[SentenceTransformer, str]:
+    """Создает embedder e5 с fallback на CPU при проблемах CUDA."""
+
     normalized_device = (device or "cpu").strip().lower()
     if normalized_device not in {"cpu", "cuda"}:
         raise ValueError("E5_EMBEDDING_DEVICE/EMBEDDING_DEVICE должен быть 'cpu' или 'cuda'")
@@ -212,6 +248,8 @@ def build_sentence_embedder(model_path: str, device: str) -> tuple[SentenceTrans
 
 
 def _e5_query(text: str) -> str:
+    """Нормализует строку в e5-формат запроса `query: ...`."""
+
     raw = (text or "").strip()
     if raw.lower().startswith("query:"):
         return raw
@@ -219,6 +257,8 @@ def _e5_query(text: str) -> str:
 
 
 class MultilingualE5LargeFaissRetriever:
+    """Ретривер FAISS для эмбеддингов multilingual-e5-large."""
+
     def __init__(
         self,
         *,
@@ -228,6 +268,8 @@ class MultilingualE5LargeFaissRetriever:
         embedding_device: str,
         top_k: int,
     ) -> None:
+        """Инициализирует e5-ретривер индексом, корпусом и embedder-ом."""
+
         self._index = index
         self._texts = texts
         self._embedder = embedder
@@ -242,6 +284,8 @@ class MultilingualE5LargeFaissRetriever:
         embedder: SentenceTransformer | None = None,
         embedding_device: str | None = None,
     ) -> "MultilingualE5LargeFaissRetriever":
+        """Собирает ретривер из конфига и опционально shared-embedder."""
+
         _enforce_single_thread()
 
         if not config.index_path.exists():
@@ -273,6 +317,10 @@ class MultilingualE5LargeFaissRetriever:
         )
 
     def retrieve(self, query: str, top_k: int | None = None) -> list[str]:
+        """Ищет наиболее релевантные контексты для пользовательского вопроса."""
+
+        started = time.perf_counter()
+        log_runtime_event("retriever", "started", system=RAG_SYSTEM_NAME, top_k=top_k or self._top_k)
         target_top_k = int(top_k or self._top_k)
         vectors = self._embedder.encode(
             [_e5_query(query)],
@@ -282,26 +330,45 @@ class MultilingualE5LargeFaissRetriever:
         ).astype("float32")
         _, indexes = self._index.search(vectors, target_top_k)
         found = indexes[0].tolist() if len(indexes) else []
-        return [self._texts[i] for i in found if 0 <= i < len(self._texts)]
+        contexts = [self._texts[i] for i in found if 0 <= i < len(self._texts)]
+        elapsed = time.perf_counter() - started
+        log_runtime_event(
+            "retriever",
+            "finished",
+            system=RAG_SYSTEM_NAME,
+            contexts_count=len(contexts),
+            elapsed_sec=round(elapsed, 3),
+        )
+        return contexts
 
     @property
     def embedder(self) -> SentenceTransformer:
+        """Возвращает embedder, используемый ретривером."""
+
         return self._embedder
 
     @property
     def embedding_device(self) -> str:
+        """Возвращает устройство embedder-а (`cpu/cuda`)."""
+
         return self._embedding_device
 
     @property
     def texts(self) -> list[str]:
+        """Возвращает текстовый корпус ретривера."""
+
         return self._texts
 
     @property
     def top_k(self) -> int:
+        """Возвращает значение `top_k` по умолчанию."""
+
         return self._top_k
 
 
 class MultilingualE5LargeRagSystem:
+    """Полная RAG-система: e5 retrieval + LLM generation."""
+
     def __init__(
         self,
         *,
@@ -311,6 +378,8 @@ class MultilingualE5LargeRagSystem:
         prompt_template: str,
         embedding_model_path: str,
     ) -> None:
+        """Инициализирует RAG-систему зависимостями и параметрами генерации."""
+
         self._retriever = retriever
         self._llm = llm
         self._llm_backend = llm_backend
@@ -318,30 +387,51 @@ class MultilingualE5LargeRagSystem:
         self._embedding_model_path = embedding_model_path
 
     def answer(self, question: str) -> RagAnswer:
+        """Генерирует ответ по найденным контекстам и шаблону промпта."""
+
+        log_runtime_event("rag", "question_started", system=RAG_SYSTEM_NAME, question_chars=len(question or ""))
         contexts = self._retriever.retrieve(question)
         context_text = "\n\n".join(f"{i + 1}. {ctx}" for i, ctx in enumerate(contexts)) or "Контексты не найдены."
         prompt = self._prompt_template.format(contexts=context_text, question=question)
 
-        raw = self._llm.invoke(prompt)
+        with request_source("rag"):
+            raw = self._llm.invoke(prompt)
         text = getattr(raw, "content", raw)
         if isinstance(text, list):
             text = " ".join(str(part) for part in text)
 
+        log_runtime_event(
+            "rag",
+            "question_finished",
+            system=RAG_SYSTEM_NAME,
+            contexts_count=len(contexts),
+            answer_chars=len(str(text or "")),
+        )
         return RagAnswer(answer=str(text).strip(), contexts=contexts)
 
     def get_chat_model(self):
+        """Возвращает внутренний LLM для shared-режима с `ragas`."""
+
         return self._llm
 
     def get_sentence_embedder(self) -> SentenceTransformer:
+        """Возвращает embedder ретривера для повторного использования."""
+
         return self._retriever.embedder
 
     def get_embedding_device(self) -> str:
+        """Возвращает устройство, на котором считается retrieval."""
+
         return self._retriever.embedding_device
 
     def get_embedding_model_path(self) -> str:
+        """Возвращает путь к модели эмбеддингов."""
+
         return self._embedding_model_path
 
     def get_system_config(self) -> dict[str, str | int | float | None]:
+        """Возвращает срез параметров системы для отчета/диагностики."""
+
         return {
             "llm_backend": self._llm_backend,
             "embedding_model_path": self._embedding_model_path,
@@ -358,6 +448,12 @@ def build_rag_system(
     shared_llm=None,
     shared_embedder: SentenceTransformer | None = None,
 ) -> MultilingualE5LargeRagSystem:
+    """Собирает экземпляр `MultilingualE5LargeRagSystem`.
+
+    Поддерживает переиспользование shared-зависимостей (LLM/embedder), чтобы
+    ускорить прогон и снизить потребление памяти.
+    """
+
     cfg = config or load_config_from_env()
 
     backend = llm_backend or cfg.llm_backend
@@ -371,9 +467,8 @@ def build_rag_system(
             backend=backend,
             timeout=cfg.model_timeout_seconds,
             gigachat_options={
-                "model": cfg.gigachat_model,
-                "credentials": cfg.gigachat_credentials,
-                "scope": cfg.gigachat_scope,
+                "model_name": cfg.gigachat_model_name,
+                "api_token": cfg.gigachat_api_token,
                 "base_url": cfg.gigachat_base_url,
             },
             koboldcpp_options={
