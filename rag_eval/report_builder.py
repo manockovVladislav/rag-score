@@ -113,20 +113,17 @@ def _metric_legend_html(df: pd.DataFrame) -> str:
 
 
 def _compute_health_score(scores_df: pd.DataFrame) -> dict[str, t.Any]:
-    metric_weights: list[tuple[str, float]] = [
-        ("faithfulness", 1.0),
-        ("answer_relevancy", 1.0),
-        ("context_precision", 1.0),
-        ("context_recall", 1.0),
-        ("bge_answer_ground_truth_cosine", 0.7),
-        ("bge_context_question_max_cosine", 0.5),
-        ("token_jaccard_answer_ground_truth", 0.3),
+    # Health Score строится только по RAGAS-метрикам (без векторизатора/Jaccard).
+    ragas_metrics = [
+        "faithfulness",
+        "answer_relevancy",
+        "context_precision",
+        "context_recall",
     ]
 
     used: list[dict[str, t.Any]] = []
-    weighted_sum = 0.0
-    total_weight = 0.0
-    for metric, weight in metric_weights:
+    means: list[float] = []
+    for metric in ragas_metrics:
         if metric not in scores_df.columns:
             continue
         series = pd.to_numeric(scores_df[metric], errors="coerce").dropna()
@@ -134,14 +131,13 @@ def _compute_health_score(scores_df: pd.DataFrame) -> dict[str, t.Any]:
             continue
         mean_value = float(series.mean())
         normalized = max(0.0, min(1.0, mean_value))
-        weighted_sum += normalized * weight
-        total_weight += weight
-        used.append({"metric": metric, "mean": mean_value, "weight": weight})
+        means.append(normalized)
+        used.append({"metric": metric, "mean": mean_value})
 
-    if total_weight == 0:
+    if not means:
         return {"score_100": None, "status": "n/a", "status_ru": "Недостаточно данных", "used": used}
 
-    score_100 = round((weighted_sum / total_weight) * 100.0, 1)
+    score_100 = round((sum(means) / len(means)) * 100.0, 1)
     if score_100 >= 85:
         status = ("excellent", "Отлично")
     elif score_100 >= 70:
@@ -197,7 +193,7 @@ def _health_details_html(payload: dict[str, t.Any]) -> str:
     items = "".join(
         (
             f"<li><span class=\"code\">{escape(_display_metric_name(str(item['metric'])))}</span>: "
-            f"mean={float(item['mean']):.3f}, weight={float(item['weight']):.1f}</li>"
+            f"mean={float(item['mean']):.3f}</li>"
         )
         for item in used
     )
